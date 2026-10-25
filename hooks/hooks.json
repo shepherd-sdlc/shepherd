@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "pwsh -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PLUGIN_ROOT}/hooks/shepherd-session-start.ps1\" || bash \"${CLAUDE_PLUGIN_ROOT}/hooks/shepherd-session-start.sh\"",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}

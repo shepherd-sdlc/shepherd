@@ -1,0 +1,1071 @@
+# Scripts Reference
+
+Detailed documentation for all Python automation scripts in the `scripts/` directory.
+
+---
+
+## Table of Contents
+
+- [1. Script System Overview](#1-script-system-overview)
+- [2. uv Runtime](#2-uv-runtime)
+- [3. Script Reference](#3-script-reference)
+  - [validate_profile.py](#validate_profilepy)
+  - [init_project.py](#init_projectpy)
+  - [check_gates.py](#check_gatespy)
+  - [advance_phase.py](#advance_phasepy)
+  - [generate_phase_report.py](#generate_phase_reportpy)
+  - [generate_status.py](#generate_statuspy)
+  - [synthesize_spec.py](#synthesize_specpy)
+  - [map_deep_plan_artifacts.py](#map_deep_plan_artifactspy)
+  - [risk_model.py](#risk_modelpy)
+  - [new_spec.py](#new_specpy)
+  - [check_spec.py](#check_specpy)
+  - [track_specs.py](#track_specspy)
+  - [scorecard.py](#scorecardpy)
+  - [doctor.py](#doctorpy)
+  - [code_host.py](#code_hostpy)
+- [4. Dependencies](#4-dependencies)
+- [5. Error Handling](#5-error-handling)
+- [6. Cross-References](#6-cross-references)
+
+---
+
+## 1. Script System Overview
+
+All scripts in this project share a common design philosophy:
+
+- **Python 3.12+** required (uses `Path | None` union syntax, modern type hints)
+- **Run via uv** -- the universal Python package manager acts as the runtime
+- **Stateless execution** -- each script reads input files, processes them, and writes output; no persistent in-memory state between invocations
+- **Exit codes** -- `0` = success, `1` = failure (with structured error details on stderr), `2` = configuration/usage error (some scripts)
+- **Plugin-root aware** -- scripts resolve the plugin root via `Path(__file__).resolve().parent.parent`, enabling them to locate schemas, templates, and phase definitions regardless of the caller's working directory
+- **YAML-centric** -- `state.yaml`, `profile.yaml`, and `phase-registry.yaml` are the core data files; all scripts use PyYAML for reading and writing
+
+Commands invoke scripts using:
+
+```bash
+uv run --project ${CLAUDE_PLUGIN_ROOT}/scripts ${CLAUDE_PLUGIN_ROOT}/scripts/<script>.py [args]
+```
+
+---
+
+## 2. uv Runtime
+
+### What uv Is
+
+[uv](https://github.com/astral-sh/uv) is a fast Python package manager and project tool written in Rust. It replaces pip, pip-tools, virtualenv, and pyenv in a single binary. The SDLC plugin uses uv because:
+
+- It resolves and installs dependencies 10-100x faster than pip
+- It creates isolated virtual environments automatically per project
+- It ensures reproducible script execution across machines
+- Commands can invoke scripts without manually activating a virtualenv
+
+### Installation
+
+```bash
+# Using pip (any platform)
+pip install uv
+
+# macOS via Homebrew
+brew install uv
+
+# Windows via winget
+winget install astral-sh.uv
+
+# Standalone installer (Linux/macOS)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+### Syncing Dependencies
+
+Before first use (or after updating `pyproject.toml`):
+
+```bash
+cd ${CLAUDE_PLUGIN_ROOT}/scripts
+uv sync
+```
+
+This creates a `.venv/` inside `scripts/` and installs all dependencies declared in `pyproject.toml`.
+
+### How Commands Invoke Scripts
+
+Slash commands (e.g., `/sprd-gate`, `/sprd-next`) invoke scripts with the `--project` flag pointing to the scripts directory. This tells uv which `pyproject.toml` governs the environment:
+
+```bash
+uv run --project /path/to/shepherd/scripts /path/to/shepherd/scripts/check_gates.py --state .sdlc/state.yaml --phase 0
+```
+
+The `--project` flag is critical -- without it, uv would look for a `pyproject.toml` in the caller's working directory instead of the plugin's scripts directory.
+
+---
+
+## 3. Script Reference
+
+---
+
+### validate_profile.py
+
+**Purpose:** Validate a company profile YAML file against the canonical schema (`profiles/_schema.yaml`). This is the first script run during project initialization and acts as a gatekeeper ensuring profile correctness before any SDLC state is created.
+
+**CLI:**
+
+```bash
+uv run scripts/validate_profile.py <profile.yaml>
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `<profile.yaml>` | Yes | Path to the profile YAML file to validate (positional) |
+
+**Input:** A single profile YAML file path. The schema is loaded automatically from `profiles/_schema.yaml` relative to the plugin root.
+
+**Validation Process:**
+
+1. **Load schema** from `profiles/_schema.yaml` (resolved via `SCHEMA_PATH = Path(__file__).resolve().parent.parent / "profiles" / "_schema.yaml"`)
+2. **Load profile** YAML from the provided path
+3. **Run validation checks** in sequence:
+
+| Check | What It Validates |
+|-------|-------------------|
+| Required fields | Top-level fields declared in schema `required` array |
+| `version` | Must be a string |
+| `company.name` | Required string |
+| `company.profile_id` | Required string |
+| `stack.backend_language` | Required; enum validation against allowed languages |
+| `stack.backend_framework` | Required string |
+| `stack.frontend_framework` | Optional; enum if present |
+| `stack.cloud_provider` | Required; enum (`azure`, `aws`, `gcp`, `on-prem`, `hybrid`) |
+| `stack.ci_cd` | Required string |
+| `quality.coverage_minimum` | Numeric range 0-100 |
+| `quality.max_file_lines` | Numeric, minimum 1 |
+| `quality.max_function_lines` | Numeric, minimum 1 |
+| `compliance.frameworks` | List; each item validated against enum (`soc2`, `hipaa`, `gdpr`, `pci-dss`, `iso27001`, `fedramp`, `none`) |
+| `compliance.change_approval` | Enum (`peer-review`, `manager-approval`, `change-board`, `none`) |
+| `conventions` | Type-checked as dict if present |
+
+**Helper Functions:**
+
+- `load_yaml(path)` -- Safe YAML loading via `yaml.safe_load`
+- `validate_required(data, required, context)` -- Checks required field presence, returns error list with field paths
+- `validate_type(value, expected_type, context)` -- Type checking (`string`, `int`, `float`, `list`, `dict`)
+- `validate_enum(value, allowed, context)` -- Enum membership validation
+- `validate_range(value, minimum, maximum, context)` -- Numeric range validation
+
+**Output on success:**
+
+```
+PASS -- starter.yaml is valid
+```
+
+**Output on failure:**
+
+```
+FAIL -- 3 validation error(s):
+  x company: missing required field 'profile_id'
+  x stack.cloud_provider: 'digital-ocean' not in allowed values: azure, aws, gcp, on-prem, hybrid
+  x quality.coverage_minimum: 150 > maximum 100
+```
+
+**Exit codes:** `0` (valid), `1` (invalid or file not found)
+
+---
+
+### init_project.py
+
+**Purpose:** Initialize the `.sdlc/` directory structure in a target project. This is the bootstrapping script that creates the entire SDLC workspace, including artifact directories for all 9 phases, the initial state file, and a frozen copy of the selected profile.
+
+**CLI:**
+
+```bash
+uv run scripts/init_project.py --profile <profile.yaml> --target <project-dir> [--name <project-name>]
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--profile` | Yes | Path to the company profile YAML |
+| `--target` | Yes | Path to the target project directory |
+| `--name` | No | Project name (defaults to target directory name) |
+
+**Process:**
+
+1. **Load and validate profile** -- Reads the profile YAML (does not re-run full schema validation; assumes prior `validate_profile.py` pass)
+2. **Check for existing `.sdlc/`** -- If `.sdlc/` already exists, prints a warning and exits without modifying anything (safe re-run behavior)
+3. **Create directory structure** -- one **empty** artifact directory per phase (slugs from the registry), plus the context directories:
+   ```
+   .sdlc/
+     artifacts/
+       00-discovery/       (empty -- artifacts are authored later, not seeded)
+       01-requirements/
+       02-design/
+       03-foundation/
+       build/
+       07-documentation/
+       08-deployment/
+       09-monitoring/
+       close/
+     context/
+       layers/             (frozen per-phase layers)
+       intake/             (document-intake summaries; opt-in via profile.documentation)
+     state.yaml
+     profile.yaml
+     constitution.md       (only if templates/constitution.md exists)
+   ```
+4. **Generate `state.yaml`** from `templates/state-init.yaml` with variable substitution:
+   - `${PROFILE_ID}` -- replaced with `profile.company.profile_id`
+   - `${PROJECT_NAME}` -- replaced with `--name` argument or target directory name
+   - `${CREATED_AT}` -- replaced with current UTC timestamp in ISO 8601 format
+5. **Copy frozen profile** -- Writes the profile to `.sdlc/profile.yaml` (via `yaml.dump`, `sort_keys=False`) so the project retains its configuration even if the source profile changes
+6. **Copy the constitution template** -- Copies `templates/constitution.md` to `.sdlc/constitution.md` if it exists
+
+> **Note:** `init_project.py` does **not** seed phase-artifact templates. The artifact directories are created empty; the files under `templates/phases/<slug>/` are references the phase docs and agents author artifacts from — auto-seeding placeholder files would fail the completeness gate (G2) on every fresh project. The exceptions written at init are `constitution.md` and `state.yaml`.
+
+**Key Constants:**
+
+- `PLUGIN_ROOT` -- Resolved plugin directory (`Path(__file__).resolve().parent.parent`)
+- `TEMPLATES_DIR` -- `templates/` under the plugin root (`${CLAUDE_PLUGIN_ROOT}`)
+- `PHASE_DIRS` -- Ordered list of 9 phase directory names (the phase slugs from `phase-registry.yaml`; not derived by zero-padding ints -- `build` and `close` are non-numeric)
+
+**Output on success:**
+
+```
+Created .sdlc/ in /path/to/project
+  Profile: starter
+  Artifacts: 9 phase directories
+  Context: frozen layers + intake directories
+  State: Phase 0 (Discovery) active
+```
+
+If `.sdlc/` already exists, the script prints `Warning: <path>/.sdlc already exists. Skipping creation.` and exits `0` without modifying anything.
+
+**Exit codes:** `0` (success), `1` (profile not found or load error)
+
+---
+
+### check_gates.py
+
+**Purpose:** Run the 7-gate validation system against a specific SDLC phase. This is the most complex script (~11KB) and serves as the quality enforcement engine. It reads the phase registry to determine which artifacts are required, then runs each gate check against the artifacts directory.
+
+**CLI:**
+
+```bash
+uv run scripts/check_gates.py --state <state.yaml> --phase <N>
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | Yes | Path to `.sdlc/state.yaml` |
+| `--phase` | Yes | Phase id (`0`, `1`, `2`, `3`, `build`, `7`, `8`, `9`, `close` -- may be a string) to check |
+
+**Key Functions:**
+
+- `get_phase_registry()` -- Loads `phases/phase-registry.yaml` from the plugin root
+- `get_compliance_gates(profile)` -- Loads framework-specific gates from `profiles/<profile_id>/compliance/<framework>-gates.yaml`
+- `check_artifact_exists(artifacts_dir, artifact)` -- Gate 1: Verifies file/directory existence and non-emptiness
+- `check_artifact_not_empty(artifacts_dir, artifact)` -- Gate 1: Ensures files have content (>0 bytes)
+- `check_artifact_complete(artifacts_dir, artifact)` -- Gate 2: Scans for placeholder patterns
+- `check_phase_gates(phase_id, state, profile, artifacts_base)` -- Main orchestrator; runs all gates and returns results list
+- `format_results(results)` -- Formats gate results for human-readable output
+
+**Gate Details:**
+
+#### Gate 1: Integrity (G1-integrity)
+
+Checks that all required artifacts for the phase exist and are well-formed.
+
+- **File existence:** Verifies each required artifact file is present in `.sdlc/artifacts/<phase-dir>/`
+- **Non-empty check:** Files must have content (>0 bytes)
+- **Directory children:** If the artifact is a directory (e.g., `section-plans/`), verifies it contains at least one child item
+- **Severity:** MUST
+
+#### Gate 2: Completeness (G2-completeness)
+
+Scans artifact content for placeholder patterns that indicate incomplete work.
+
+**Detected patterns:**
+- `TODO` -- Unfinished work markers
+- `TBD` -- "To be determined" placeholders
+- `${...}` -- Unresolved template variables
+- `PLACEHOLDER` -- Explicit placeholder text
+- `[INSERT` -- Template insertion points (e.g., `[INSERT DESCRIPTION HERE]`)
+- `<!-- REQUIRED:` -- marks a section that must be written; **delete the comment once you have written it**, or the artifact never passes
+
+For each artifact, the script reads the file content and checks against these patterns. If any match is found, the artifact fails the completeness gate.
+
+Ordinary bracket prose (`[Describe the situation]`) is deliberately **not** in the list: templates
+use `- [ ]` checkboxes and `[text](links)`, so a general bracket rule would fail nearly every
+artifact. The consequence is that a carelessly half-filled artifact can pass — the check is a
+tripwire for an untouched template, not a proofreader.
+
+**Build loop:** the gate prints a spec-backlog summary via `track_specs.py` instead of a section consistency check. It scans `<repo>/specs/*.md`, reads each spec's frontmatter `status` (`draft`/`ready`/`in-flight`/`merged`, or `deferred`) and `risk` (`HIGH`/`MEDIUM`/`LOW`), and reports as `INFO`:
+- Total specs
+- Status breakdown (merged / in-flight / ready / draft)
+- Risk breakdown (HIGH / MEDIUM / LOW)
+- The in-flight list
+
+`check_gates.py` is protected core, so this line's four-status breakdown is unchanged — a deferred spec is still counted in the total but does not get its own number here. `track_specs.py`'s own report and `--json` output do break it out (see [`track_specs.py`](#track_specspy) below).
+
+This is informational and does not block — progress is read directly from the spec files (the unit of work: one spec = one branch = one PR), so it cannot drift from a separately maintained tracker.
+
+**Severity:** MUST (the completeness gate itself); the spec-backlog summary is INFO
+
+#### Gate 3: Metrics (G3-metrics)
+
+Enforced per-change in the Build loop (coverage, file/function line counts). Checks quantitative thresholds from the profile.
+
+- **Coverage minimum:** `quality.coverage_minimum` from profile (0-100 range)
+- **File line limits:** `quality.max_file_lines` from profile
+- **Function line limits:** `quality.max_function_lines` from profile
+
+**Severity:** applied per change inside the Build loop
+
+#### Gate 4: Compliance (G4-compliance)
+
+Loads compliance-specific gates from the profile's compliance directory.
+
+- Reads `compliance.frameworks` from the profile (e.g., `["soc2", "hipaa"]`)
+- For each framework, loads `profiles/<profile_id>/compliance/<framework>-gates.yaml`
+- Runs each compliance gate check against the phase artifacts
+- Examples: requirements must have priority labels (P0-P3), design decisions need ADR status, test cases must map to requirements
+
+**Severity:** MUST for compliance-enabled profiles, SHOULD for others
+
+#### Gate 5: Cross-Phase Consistency (G5-consistency)
+
+Detects drift in locked metrics across phase transitions (budget, timeline, scope, stakeholder roster, quality thresholds, compliance requirements).
+
+- Compares locked values between successive phases for unexplained changes
+- Warns rather than blocks -- divergence is surfaced, not fatal
+- Discrepancies are documented via the decision log
+
+**Severity:** SHOULD (warns, does not block)
+
+#### Gate 6: Quality (G6-quality)
+
+Checks review status and traceability.
+
+- Verifies artifacts have been reviewed (review status markers)
+- Checks traceability links between artifacts (requirements to tests, designs to implementations)
+
+**Severity:** MUST for phases 2, 5; SHOULD for others
+
+**Output Format:**
+
+Results are returned as a list of dictionaries:
+
+```json
+[
+  {
+    "gate": "G1-integrity",
+    "artifact": "problem-statement.md",
+    "passed": true,
+    "message": "File 'problem-statement.md' exists",
+    "severity": "MUST"
+  },
+  {
+    "gate": "G2-completeness",
+    "artifact": "requirements.md",
+    "passed": false,
+    "message": "Placeholder pattern found: TODO (line 42)",
+    "severity": "MUST"
+  }
+]
+```
+
+**Gate Application by Phase:**
+
+| Phase | G1 | G2 | G3 | G4 | G5 Consistency | G6 Quality |
+|-------|:--:|:--:|:--:|:--:|:--:|:--:|
+| 0 Discovery | MUST | MUST | -- | -- | -- | SHOULD |
+| 1 Requirements | MUST | MUST | -- | MUST | SHOULD | SHOULD |
+| 2 Design | MUST | MUST | -- | MUST | SHOULD | MUST |
+| 3 Foundation | MUST | MUST | -- | -- | SHOULD | SHOULD |
+| build (Build Loop) | MUST | MUST | SHOULD | SHOULD | SHOULD | SHOULD |
+| 7 Documentation | MUST | MUST | -- | -- | SHOULD | SHOULD |
+| 8 Deployment | MUST | MUST | -- | MUST | SHOULD | SHOULD |
+| 9 Monitoring | MUST | MUST | -- | -- | SHOULD | SHOULD |
+| close (Close & Transfer) | MUST | MUST | -- | -- | SHOULD | MUST |
+
+**Exit codes:** `0` (all MUST gates pass), `1` (any MUST gate fails)
+
+---
+
+### advance_phase.py
+
+**Purpose:** Advance the SDLC project to the next phase. Supports a dry-run mode for gate preview and a confirmed mode for actual state transition. This script imports `check_phase_gates` and `format_results` directly from `check_gates.py` to reuse the gate logic.
+
+**CLI:**
+
+```bash
+# Dry-run: show gate results without advancing
+uv run scripts/advance_phase.py --state .sdlc/state.yaml
+
+# Confirmed: advance after gate checks pass
+uv run scripts/advance_phase.py --state .sdlc/state.yaml --confirmed
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | Yes | Path to `.sdlc/state.yaml` |
+| `--confirmed` | No | Human sign-off flag; without it, the script only checks gates (dry-run) |
+
+**Process:**
+
+1. **Load state and profile** from `.sdlc/state.yaml` and `.sdlc/profile.yaml`
+2. **Check phase boundary** -- if the current phase is terminal (`close`), reports completion and exits
+3. **Run all gate checks** for the current phase via `check_phase_gates()`
+4. **Print gate results** using `format_results()` (always shown, even in confirmed mode)
+5. **If any MUST gate fails:** exit with code `1`, print blockers
+6. **If dry-run (no `--confirmed`):** exit with code `0`, print message that `--confirmed` is needed
+7. **If confirmed and all gates pass:** update `state.yaml` atomically:
+   - Set current phase status to `completed` with `completed_at` timestamp
+   - Set next phase status to `active` with `entered_at` timestamp
+   - Set `current_phase` to the next phase by registry `order` (via `phase_model.py` -- not `id+1`; ids may be strings)
+   - Update `phase_name` string
+   - Append transition record to `history` array:
+     ```yaml
+     - from: <current_phase_id>
+       to: <next_phase_id>
+       at: "2026-03-26T12:00:00+00:00"
+       gate_results: { passed: N, failed: 0, total: N }
+     ```
+8. **Print next phase guidance:**
+   - Phase display name and description
+   - Primary and secondary skills
+   - Required and optional artifacts
+   - Artifact directory path
+   - Phase definition file path
+
+**Key Functions:**
+
+- `get_phase_registry()` / `get_phase_def(phase_id)` -- Load and look up phase definitions
+- `now_iso()` -- Generate UTC ISO 8601 timestamp
+- `advance(state_path, confirmed)` -- Main logic; returns `0` (success), `1` (gate failure), `2` (config error)
+- `save_yaml(path, data)` -- Atomic YAML write with `default_flow_style=False`
+
+**Output (confirmed, success):**
+
+```
+Gate Results for Phase 0 (Discovery):
+  [PASS] G1-integrity: problem-statement.md -- File exists
+  [PASS] G2-completeness: problem-statement.md -- No placeholders found
+  ...
+
+[OK] Advanced: Phase 0 (discovery) -> Phase 1 (requirements)
+
+==================================================
+Now entering: Phase 1 -- Requirements
+==================================================
+Elicit, analyze, and document functional and non-functional requirements.
+
+Primary skills:   requirements-analysis, stakeholder-interview
+Secondary skills: domain-modeling
+
+Required artifacts:
+  - requirements.md
+  - non-functional-requirements.md
+  - epics.md
+Optional artifacts:
+  - stakeholder-analysis.md
+  - phase2-handoff.md
+
+Artifact directory: .sdlc/artifacts/phase01/
+Phase definition:   phases/01-requirements.md
+
+Run /sprd to see full phase guidance.
+```
+
+(Artifact directories use the phase `slug` from the registry -- e.g. `03-foundation/`, `build/`, `close/` -- never a zero-padded id.)
+
+**Exit codes:** `0` (success or dry-run pass), `1` (gate failure), `2` (configuration error)
+
+---
+
+### generate_phase_report.py
+
+**Purpose:** Render SDLC phase artifacts as self-contained HTML reports. This is the largest script (~40KB) and produces polished, stakeholder-ready reports that can be opened directly in any browser without a server.
+
+**CLI:**
+
+```bash
+# Single phase
+uv run scripts/generate_phase_report.py --state .sdlc/state.yaml --phase 0
+
+# Single phase with custom output path
+uv run scripts/generate_phase_report.py --state .sdlc/state.yaml --phase 0 --output .sdlc/reports/00-discovery-report.html
+
+# All phases (generates individual reports + index.html)
+uv run scripts/generate_phase_report.py --state .sdlc/state.yaml --all
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | Yes | Path to `.sdlc/state.yaml` |
+| `--phase` | No | Phase number to render (0-9); mutually exclusive with `--all` |
+| `--all` | No | Generate reports for all phases plus an index page |
+| `--output` | No | Custom output path (defaults to `.sdlc/reports/<slug>-report.html`, e.g. `00-discovery-report.html`, `build-report.html`) |
+
+**Process:**
+
+1. **Load state** to determine project metadata and phase statuses
+2. **Resolve artifact directory** from the registry slug (`.sdlc/artifacts/<slug>/`), falling back to the project root and `docs/` when an artifact is not there
+3. **For each phase:**
+   - Look up required and optional artifacts from `PHASE_INFO` metadata
+   - Find each artifact file via `find_artifact()` (searches `.sdlc/artifacts/`, project root, `docs/`)
+   - Convert Markdown content to HTML via `md_to_html()`
+   - Embed into the HTML template with navigation and styling
+4. **For `--all` mode:** additionally generates `index.html` with a timeline view of all phases
+
+**Key Components:**
+
+- **`PHASE_INFO` dict** -- Maps each phase number to its display name and list of `(filename, label)` artifact tuples
+- **`md_to_html(text)`** -- Minimal GitHub-flavored Markdown to HTML converter handling:
+  - Headings (h1-h6)
+  - Code blocks with language class
+  - Tables with thead/tbody
+  - Unordered lists
+  - Bold, italic, inline code, links
+  - HTML escaping for security
+- **`find_artifact(project_root, phase_num, filename)`** -- Searches multiple locations for an artifact file
+- **`build_nav_items()` / `build_gate_items()`** -- Generate sidebar navigation and gate status indicators
+
+**Visual Features:**
+
+- Dark theme default (`#0f1117` background, `#6c8ef7` accent, `#4ade80` green)
+- Phase timeline navigation bar across the top
+- Sidebar table of contents with found/missing status indicators
+- Gate status summary showing artifact presence
+- Responsive layout (sidebar collapses on mobile)
+- All CSS and JS inlined -- no external dependencies
+- Missing artifacts appear as labeled placeholder sections (not errors)
+
+**Output:** Self-contained HTML files in `.sdlc/reports/`:
+
+```
+.sdlc/reports/
+  00-discovery-report.html
+  01-requirements-report.html
+  ...
+  index.html            (only with --all)
+```
+
+**Exit codes:** `0` (success), `1` (state file not found or phase invalid)
+
+---
+
+### generate_status.py
+
+**Purpose:** Generate a text-based status dashboard summarizing SDLC progress. Provides a quick overview of all phases, their completion status, and artifact counts.
+
+**CLI:**
+
+```bash
+# Print to stdout
+uv run scripts/generate_status.py --state .sdlc/state.yaml
+
+# Write to file
+uv run scripts/generate_status.py --state .sdlc/state.yaml --output status.md
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | Yes | Path to `.sdlc/state.yaml` |
+| `--output` | No | Write dashboard to file instead of stdout |
+
+**Process:**
+
+1. **Load state** and extract project metadata (`project_name`, `profile_id`, `current_phase`)
+2. **Calculate progress** -- count completed phases, compute percentage
+3. **Generate ASCII progress bar** -- 20-character bar with `#` (filled) and `-` (empty)
+4. **Build phase table** -- iterate all 9 phases, show status icon, name, artifact count, and timestamps
+5. **Count artifacts** per phase by scanning `.sdlc/artifacts/<phase-dir>/`
+
+**Status Icons:**
+
+| Status | Icon |
+|--------|------|
+| `completed` | `[x]` |
+| `active` | `[>]` |
+| `pending` | `[ ]` |
+| `skipped` | `[-]` |
+
+**Output Example:**
+
+```markdown
+# SDLC Status Dashboard
+**Project:** my-app
+**Profile:** starter
+**Current Phase:** 2 -- Design
+
+**Progress:** [####------------] 20% (2/9 phases)
+
+## Phases
+| # | Phase          | Status | Artifacts | Entered    | Completed  |
+|---|----------------|--------|-----------|------------|------------|
+| 0 | Discovery      | [x]    | 3         | 2026-03-01 | 2026-03-05 |
+| 1 | Requirements   | [x]    | 5         | 2026-03-05 | 2026-03-15 |
+| 2 | Design         | [>]    | 2         | 2026-03-15 | --         |
+| 3 | Foundation     | [ ]    | 0         | --         | --         |
+| build | Build Loop | [ ]    | 0         | --         | --         |
+...
+| close | Close & Transfer | [ ] | 0       | --         | --         |
+```
+
+**Exit codes:** `0` (success), `1` (state file not found)
+
+---
+
+
+### synthesize_spec.py
+
+**Purpose:** Synthesize Phase 0 (Discovery) and Phase 1 (Requirements) artifacts into a single consolidated specification file. This spec serves as the primary input for `/deep-plan` integration, providing a self-contained project description.
+
+**CLI:**
+
+```bash
+uv run scripts/synthesize_spec.py --state .sdlc/state.yaml [--output <path>]
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | Yes | Path to `.sdlc/state.yaml` |
+| `--output` | No | Output file path (defaults to `.sdlc/artifacts/spec.md`) |
+
+**Process:**
+
+1. **Resolve artifacts base** from `state.yaml` parent directory
+2. **Read Phase 0 artifacts** (optional enrichment):
+   - `00-discovery/problem-statement.md`
+   - `00-discovery/constraints.md`
+   - `00-discovery/success-criteria.md`
+3. **Read Phase 1 artifacts** (primary content):
+   - `01-requirements/requirements.md` (REQUIRED -- script exits with error if missing/empty)
+   - `01-requirements/non-functional-requirements.md`
+   - `01-requirements/epics.md`
+   - `01-requirements/phase2-handoff.md`
+4. **Assemble specification** by concatenating sections with headers:
+   - `# Project Specification` (with synthesis timestamp and source path)
+   - `## Problem Statement` (from Phase 0, if available)
+   - `## Requirements` (from Phase 1, always present)
+   - `## Non-Functional Requirements` (if available)
+   - `## Epics & User Stories` (if available)
+   - `## Constraints` (from Phase 0, if available)
+   - `## Success Criteria` (from Phase 0, if available)
+   - `## Phase 2 Handoff Notes` (if available)
+5. **Write output** to the specified path
+
+**Key Function:**
+
+- `read_artifact(path)` -- Returns file content as stripped string, or empty string if file does not exist. Uses `encoding="utf-8"` with `errors="replace"` for robustness.
+
+**Output:** A single Markdown file combining all early-phase artifacts into a format consumable by `/deep-plan`.
+
+**Exit codes:** `0` (success), `1` (`requirements.md` missing or empty, state file not found)
+
+---
+
+### map_deep_plan_artifacts.py
+
+**Purpose:** Transform `/deep-plan` section outputs into SDLC-formatted phase artifacts. This is the bridge between the `/deep-plan` planning system and the SDLC artifact structure. Supports both Phase 2 (Design) and Phase 3 (Foundation) mapping modes. The script is idempotent and safe to re-run.
+
+**CLI:**
+
+```bash
+# Phase 2 mapping (after /deep-plan steps 1-15)
+uv run scripts/map_deep_plan_artifacts.py --state .sdlc/state.yaml --phase 2 --planning-dir planning/
+
+# Phase 3 mapping (after /deep-plan steps 16-22)
+uv run scripts/map_deep_plan_artifacts.py --state .sdlc/state.yaml --phase 3 --planning-dir planning/
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | Yes | Path to `.sdlc/state.yaml` |
+| `--phase` | Yes | Target phase (2 or 3) |
+| `--planning-dir` | Yes | Path to the `/deep-plan` planning directory |
+
+**Key Functions:**
+
+- `copy_if_exists(src, dest)` -- Copies a file or directory if source exists; creates parent directories as needed; handles both files (`shutil.copy2`) and directories (`shutil.copytree` with overwrite)
+- `extract_sections_by_heading(content, level)` -- Parses Markdown into a dict of `{heading: content}` by heading level
+- `parse_section_manifest(index_content)` -- Extracts the `SECTION_MANIFEST` from `sections/index.md` using a regex match on `<!-- SECTION_MANIFEST ... END_MANIFEST -->` comment blocks
+- `parse_project_config(index_content)` -- Extracts project configuration values from the index
+- `transform_section_to_sdlc(section_name, number, content, tdd_content, manifest)` -- Converts a `/deep-plan` section file into the SDLC converged template format
+- `map_phase_2(planning_dir, artifacts_dir)` -- Phase 2 specific mapping (design artifacts)
+- `map_phase_3(planning_dir, artifacts_dir)` -- Phase 3 specific mapping (section plans)
+
+**Phase 3 Mapping Process (primary use case):**
+
+1. **Read section manifest** from `planning/sections/index.md`
+2. **Fallback discovery** -- if no manifest found, glob for `section-*.md` files directly
+3. **Read TDD plan** from `planning/claude-plan-tdd.md`
+4. **For each section in manifest:**
+   - Locate the corresponding `/deep-plan` file at `planning/sections/<section-name>.md`
+   - Transform to SDLC format via `transform_section_to_sdlc()`
+   - Write to `.sdlc/artifacts/03-foundation/section-plans/SECTION-NNN.md` (zero-padded 3-digit number)
+5. **Copy supplementary files:**
+   - `claude-plan-tdd.md` -> `.sdlc/artifacts/03-foundation/tdd-plan.md`
+   - `sections/index.md` -> `.sdlc/artifacts/03-foundation/dependency-map.md`
+
+**Converged Template Format:**
+
+The output uses `SECTION-template-deep-plan.md` which preserves both systems' requirements:
+
+- **SDLC structured fields:** Goal, Epics/Stories, Entry/Exit Criteria, Dependencies, Interfaces, Test Strategy, Risk
+- **`/deep-plan` prose:** Full implementation guidance in a dedicated "Implementation Guidance" section, self-contained enough for `/deep-implement` to consume
+
+**Output Structure:**
+
+```
+.sdlc/artifacts/03-foundation/
+  section-plans/
+    SECTION-001.md
+    SECTION-002.md
+    ...
+    SECTION-NNN.md
+  tdd-plan.md
+  dependency-map.md
+```
+
+**Exit codes:** `0` (success), `1` (state file or planning directory not found)
+
+---
+
+### risk_model.py
+
+**Purpose:** Single source of truth for the risk taxonomy and the checking ladder. A spec's risk tier (`HIGH`/`MEDIUM`/`LOW`, assigned by a human at triage) sets how high its change climbs the checking ladder in the Discern beat. This module encodes that mapping once so `check_spec.py` and any other consumer resolve review depth the same way. It is a library module (imported), not a CLI — it has no `main()`.
+
+**Imported by:** `check_spec.py`, `track_specs.py`.
+
+
+**What scales by tier:** the *depth* of human review and whether the security pass + named sign-off are mandatory — never whether checking happens at all. Every tier blocks on CI, runs the grader (advises), runs the correctness gate (blocks on a defect), and requires a non-author approval. HIGH adds a blocking security pass and a named human sign-off recorded in the PR. The security pass also fires path-triggered (any PR touching a gated path), independent of tier.
+
+**Public API:**
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `normalize_tier(tier)` | `str \| None` | Canonical upper-case tier from any source, or `None` if invalid |
+| `is_valid_tier(tier)` | `bool` | Whether the value names a valid tier |
+| `resolve_ladder(tier, touches_gated_path=False)` | `dict \| None` | The required ladder booleans for a tier (`ci_blocks`, `grader_runs`, `correctness_blocks_on_defect`, `non_author_approval`, `security_pass_required`, `named_signoff_required`, plus `review_depth`). `touches_gated_path=True` forces the security pass |
+| `required_rungs(tier, touches_gated_path=False)` | `list[str]` | Human-readable list of gates a tier must clear, in ladder order |
+
+**Module constants:** `RISK_TIERS = ("HIGH", "MEDIUM", "LOW")`, `TAXONOMY` (what lands in each tier and what it triggers — mirrored in `CLAUDE.md` so agents see it).
+
+**Exit codes:** N/A (library module).
+
+---
+
+### new_spec.py
+
+**Purpose:** Scaffold a new Build-loop spec (`specs/NNNN-name.md`) from the spec template. Specs are the durable per-change unit of the Build loop — one spec = one branch = one PR — and live in the target repo's `specs/` directory (in the repo, not under `.sdlc/`), so the agent and grader read them from version control like any source file.
+
+**CLI:**
+
+```bash
+# Workflow mode (repo root = .sdlc parent)
+uv run scripts/new_spec.py --state .sdlc/state.yaml --name "duplicate claim 409" --risk HIGH
+
+# Standalone mode (any repo, no .sdlc/ required)
+uv run scripts/new_spec.py --repo <path> --name "duplicate claim 409" --risk HIGH --source REQ-123
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | One of `--state`/`--repo` | Path to `.sdlc/state.yaml` (workflow mode) |
+| `--repo` | One of `--state`/`--repo` | Target repo root (standalone; default cwd) |
+| `--name` | Yes | Short descriptive name (becomes the kebab-case slug and frontmatter `name`) |
+| `--risk` | No | Risk tier `HIGH`/`MEDIUM`/`LOW` (default `MEDIUM`) — the agent proposes, a human confirms |
+| `--source` | No | Originating story / REQ-id (default `—`) |
+
+**Process:**
+
+1. **Resolve repo root** from `--state` (`.sdlc` parent) or `--repo`
+2. **Allocate id** — scan `specs/*.md`, take the highest 4-digit prefix + 1 (`0001` when none), so ids stay stable and gap-free across sessions
+3. **Render the template** (`templates/phases/build/spec.md`) — fill frontmatter `spec`/`name`/`risk`/`source`/`created`, the title, and sync the body `**Tier:**` and `**Ladder depth:**` lines to the chosen risk (both agreements that `check_spec.py` enforces)
+4. **Write** `specs/NNNN-slug.md` (errors if it already exists)
+
+**Exit codes:** `0` (created), `1` (invalid `--risk`, empty slug, template missing, state file missing, or spec already exists)
+
+---
+
+### check_spec.py
+
+**Purpose:** Enforce the Definition of Ready (DoR) on a Build-loop spec — the "Intent rail": a story becomes buildable only by clearing the DoR. Checks the mechanical floor of that bar (structure, risk tier, scope in/out, no placeholders, field/section agreement, checking-ladder depth) plus an advisory vague-line lint on acceptance checks.
+
+**CLI:**
+
+```bash
+# Standalone
+uv run scripts/check_spec.py --spec specs/0001-duplicate-claim-409.md
+
+# Workflow (also logs metrics to .sdlc/metrics/spec-log.jsonl)
+uv run scripts/check_spec.py --spec specs/0001-duplicate-claim-409.md --state .sdlc/state.yaml
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--spec` | Yes | Path to `specs/NNNN-name.md` |
+| `--state` | No | Path to `.sdlc/state.yaml` — enables empirical metrics logging |
+
+**Checks (MUST blocks, exit 1; SHOULD advises, exit 0 — mirrors `check_gates.py` severities):**
+
+| Severity | Check |
+|----------|-------|
+| MUST | Parseable YAML frontmatter present |
+| MUST | `name` set (not the template default) |
+| MUST | `risk` is one of HIGH/MEDIUM/LOW |
+| MUST | All required sections present (Goal, Why, Scope, Acceptance Checks, Risk Tier, Delegation Plan, Checking Plan) |
+| MUST | Scope > In scope **and** Scope > Out of scope both non-empty |
+| MUST | At least one acceptance check |
+| MUST | No unfilled template placeholders (`TODO`, `TBD`, `NNNN`, `<title>`, …) |
+| MUST | Risk Tier section agrees with frontmatter `risk` |
+| MUST | Checking Plan `**Ladder depth:**` declared and equal to the risk tier |
+| SHOULD | `harness_context` names the ONE existing pattern reused |
+| SHOULD | Vague-line lint — acceptance checks carrying vague words or lacking a concrete signal |
+| SHOULD | HIGH spec's Checking Plan names the security pass and the named sign-off |
+
+**Key functions:** `parse_frontmatter`, `extract_section` / `extract_subsection`, `list_items`, `check_spec_text` (the orchestrator, importable — reused by `track_specs.py`), `log_spec_metrics`, `format_results`.
+
+**Exit codes:** `0` (ready, possibly with advisories), `1` (any MUST fails, or spec not found)
+
+---
+
+### track_specs.py
+
+**Purpose:** Track the Build-loop spec backlog from the specs themselves. In the spec-driven Build loop the spec IS the unit of work and the durable source of truth, so backlog progress is derived from each spec's frontmatter `status` — never from a separate hand-maintained tracker that can drift. This replaced the section-plan progress model (`sections-progress.json`) in the Build loop.
+
+**CLI:**
+
+```bash
+# Workflow
+uv run scripts/track_specs.py --state .sdlc/state.yaml [--wip-cap 3] [--json]
+
+# Standalone
+uv run scripts/track_specs.py --repo <path>
+```
+
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` | One of `--state`/`--repo` | Path to `.sdlc/state.yaml` (workflow mode) |
+| `--repo` | One of `--state`/`--repo` | Target repo root (standalone; default cwd) |
+| `--wip-cap` | No | Flag when more than N specs are in-flight (the cap itself lives in `cadence-plan.md`; the cap is global — a sprint's slate is never a second WIP budget) |
+| `--sprint` | No | Only the specs whose frontmatter `sprint:` equals `SNN` exactly (applied before summarizing, so every count is for that slate); the text title becomes "Spec Backlog — sprint SNN" and the JSON gains `sprint_filter` |
+| `--json` | No | Emit the summary as JSON |
+
+**Output:** Total specs; breakdown by status (`draft`/`ready`/`in-flight`/`merged`, plus `deferred` on its own line once any spec uses it — never pre-seeded at zero, so a project that has never deferred a spec sees unchanged output) and by risk tier; the in-flight list (one spec = one branch = one PR; deferred specs are never in it); WIP-cap warnings. Invoked by `check_gates.py` to print the Build gate's INFO spec-backlog summary (that line stays the original four statuses — see above).
+
+
+Files whose frontmatter `spec:` id is not numeric (the installed `specs/spec-template.md` carries `spec: "NNNN"`) are skipped, so the template is not counted as a phantom draft here or in the Build gate's backlog line.
+
+
+**Key functions:** `scan_specs` (parses every `specs/*.md` frontmatter), `summarize`, `wip_warnings`, `filter_by_sprint`, `sprint_bucket`, `sprint_ids`, `is_spec_id` — all importable; constants `UNASSIGNED_BUCKET`, `PRE_SPRINT_BUCKET`.
+
+**Exit codes:** `0` (no warnings), `1` (a WIP-cap breach was flagged) — unchanged by the sprint additions
+
+---
+
+### scorecard.py
+
+**Purpose:** Record and report the Build-loop steering scorecard — the numbers that steer the loop, baseline-and-trend. The delivery-standard steers on **outcomes, not activity**. This tool records loop outcome events to `.sdlc/metrics/loop-events.jsonl` and reports the scorecard from them. It is deliberately separate from `gate-log.jsonl` (gate calibration) and `spec-log.jsonl` (DoR data): those measure the harness; this measures delivery.
+
+**CLI:**
+
+```bash
+# Record an outcome event
+uv run scripts/scorecard.py record --state .sdlc/state.yaml --type spec_merged --field accepted_as_is=true --field risk=HIGH
+
+# Report the scorecard
+uv run scripts/scorecard.py report --state .sdlc/state.yaml [--window-days 14] [--json]
+```
+
+**Subcommands & arguments:**
+
+| Subcommand | Argument | Description |
+|------------|----------|-------------|
+| `record` / `report` | `--state` / `--repo` | `.sdlc/state.yaml` (workflow) or repo root (standalone; default cwd) |
+| `record` | `--type` | Event type (see below) |
+| `record` | `--field key=value` | Repeatable; bools/ints/floats coerced, else string |
+| `report` | `--window-days` | Label only (date filtering is the caller's job) |
+| `report` | `--json` | Emit the scorecard as JSON |
+
+**Event types:** `spec_merged` (`accepted_as_is`, `risk`), `spec_reverted`, `spec_bounced`, `escaped_bug` (`which_check`), `deploy` (`env`, `succeeded`, `lead_time_hours`, `caused_failure`), `incident` (`ttr_hours`), `review_wait` (`wait_hours`, `security`).
+
+**Reported metrics:** accepted-as-is rate, rework/revert rate, bounce-back rate, review-wait median (security-review wait on its own line), the DORA four (deploy count, lead-time median, change-fail rate, time-to-recover median), and escaped bugs. Missing data reads **"no data"**, never a fabricated zero.
+
+**Refused by design:** recording `velocity`, `story_points`, `pr_count`, `lines_of_code`, `commits` exits `2` — the activity metrics the standard never tracks. `compute_scorecard`, `load_events`, `format_report`, `_pct`, `_hrs` are importable.
+
+
+**Exit codes:** `0` (success), `1` (unknown event type, bad `--field`, or state file missing), `2` (a forbidden activity metric was passed to `record`)
+
+---
+
+
+### doctor.py
+
+**Purpose:** Backs `/sprd-doctor` — a day-1 check that the installed harness will actually run in a repo, not just that it was copied into one. Checks the things that fail quietly: a hook registered with a missing interpreter, a rails script installed without its executable bit, a repo secret the gates need that nobody set.
+
+**CLI:**
+
+```bash
+uv run scripts/doctor.py                 # in the client repo
+uv run scripts/doctor.py --repo <path>   # check a different repo
+uv run scripts/doctor.py --offline       # skip the checks that need gh/az
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--repo` | No | Repo to check (default: current directory) |
+| `--offline` | No | Skip the checks that need `gh`/`az` (repo secrets, branch protection) |
+
+**Process:**
+
+1. **`installed_platform(repo)`** reads the composed CI/CD pack id out of `.claude/harness-manifest.json` and returns `"github"` or `"azure-devops"`. Every check below that touches the platform's CLI branches on this instead of a fixed assumption.
+2. Runs eight sections in order, printing `PASS`/`FAIL`/`WARN` per line with a `fix:` line attached to anything not `PASS`:
+   - **Tools** — required interpreters present (`pwsh`, `uv`, `node`, etc.) plus `gh` on GitHub installs or `az` (+ the `azure-devops` extension) on Azure DevOps installs, never the other
+   - **Harness** — the harness was actually installed (`.claude/harness-manifest.json` exists), otherwise the rest of the report is meaningless
+   - **Hooks** — registered hooks resolve to a present interpreter
+   - **Permissions** — installed rails scripts carry the executable bit (Windows: `WARN`, POSIX permission bits aren't visible there)
+   - **Unfinished setup** — residual `<<TOKEN>>` placeholders left in installed files, each mapped to the phase that fills it (`TOKEN_OWNER`); `.azuredevops/` is a scan root alongside `.github/`
+   - **MCP** — required MCP servers configured
+   - **Repo secrets** *(needs network)* — GitHub: `required_secrets()` reads the names referenced by installed workflows and checks each via `gh secret list`. Azure DevOps: `required_variable_groups()` reads `- group: NAME` references out of the installed pipelines (quote-aware, so a `<<VARIABLE_GROUP>>` sentinel or template expression is reported as unfinished setup rather than a missing group) and checks each via `az pipelines variable-group list`
+   - **Branch protection** *(needs network)* — GitHub: the active ruleset. Azure DevOps: `az repos policy list`, where "enforcing" means `isEnabled AND isBlocking` — an enabled-but-optional policy is advice, not a gate
+3. Exits `1` if any `FAIL` was recorded (warnings never fail the run); prints a one-line summary either way.
+
+**Platform-aware, not platform-agnostic:** nothing here asks a GitHub repo to authenticate `az`, or an Azure DevOps repo to install `gh`. A repo that `installed_platform()` cannot recognize as Azure DevOps gets the GitHub checks — the same behavior every install had before the CI/CD packs existed.
+
+**Exit codes:** `0` (no failures; warnings may be present), `1` (at least one failure — the harness is not fully working)
+
+---
+
+### code_host.py
+
+**Purpose:** Answer one question every pull-request-facing script asks first: which code host is this repository on, and which CLI talks to it? **The repository chooses** — detection keys off the `origin` remote, never a global setting or a profile field (the profile describes the CI pack; the host is a property of the clone).
+
+
+**Usage:**
+```bash
+uv run scripts/code_host.py --repo <path> [--json] [--no-probe]
+uv run scripts/code_host.py --state .sdlc/state.yaml --json
+uv run scripts/code_host.py --repo <path> --host azure-devops --json   # override for this run
+```
+
+**Arguments:**
+
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--state` / `--repo` | No | Workflow mode / standalone mode (default: cwd); works with no `.sdlc/` present |
+| `--host` | No | `github`, `azure-devops` or `none` — override detection for this invocation |
+| `--json` | No | Exactly one JSON document |
+| `--no-probe` | No | Skip the local CLI probes (`gh auth status` / `az account show`); `cli_state` reads `unknown` |
+
+**Override precedence** (`detect_host()` reports which one won as `source`): `--host` flag → `SHEPHERD_CODE_HOST` env (or `SDLC_CODE_HOST`, the pre-2.0 name — still read; the new name wins when both are set) → `.sdlc/code-host.yaml` (written by `set_setting.py code-host --host …`; travels with the clone) → the parsed `origin` remote (`code_host_remote.parse_remote`, shared fixture `scripts/tests/fixtures/code_host/remote-urls.json`) → the harness manifest's CI pack as a tie-breaker only when there is no usable remote → `none`. `none` falls through to `gh` (`cli_for("none") == "gh"`), so every repository that existed before this layer behaves exactly as it did.
+
+**Two axes, never merged:** `detect_host()` owns the code host (PRs, identity, policies); `installed_ci_platform()` owns the CI platform (pipeline dirs, runs, secrets) — a ten-line twin of `doctor.installed_platform()` pinned to agree with it, so `doctor.py` is never imported. A GitHub repository on Azure Pipelines is legitimate; nothing resolves the mismatch silently.
+
+**Output:** the `host` block `{name, source, cli, cli_state, detail}` that every host-touching `--json` carries (`host_report.py` renders it from the outcome of the call a script just made, never from a second probe). `cli_state` ∈ `available` / `not_installed` / `extension_missing` / `signed_out` / `unknown`; `detail` names the fix (`run az extension add --name azure-devops`, `run az login`, …) and, on Azure DevOps, the rule that the CLI's **default account decides the token** (a guest identity signs in with `az login --allow-no-subscriptions`; an identity that never opened the organisation in a browser gets HTTP 403 "has not been materialized"). `unknown` is never read as "no".
+
+**Identity:** `resolve_person(roster, identity)` — GitHub: `@` + login when that handle is in the roster; Azure DevOps: the handle whose `people[].email` equals the UPN case-insensitively; otherwise `None`. A provider never guesses a handle from a display name or a UPN prefix.
+
+**Exit codes:** `0` always; `2` on a usage error.
+
+**Consumers:** `spec_status.py`, `handoff.py`, `connection_report.py`, `gate_auth.py`, `gate_inventory.py` (CI axis).
+
+
+---
+
+
+## 4. Dependencies
+
+Defined in `scripts/pyproject.toml`:
+
+```toml
+[project]
+name = "shepherd-scripts"
+version = "0.1.0"
+description = "Automation scripts for the Shepherd plugin"
+requires-python = ">=3.12"
+dependencies = [
+    "pyyaml>=6.0",
+    "jsonschema>=4.20",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+]
+```
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| **PyYAML** | >=6.0 | YAML parsing and serialization for `state.yaml`, `profile.yaml`, `phase-registry.yaml`, and compliance gate files |
+| **jsonschema** | >=4.20 | JSON Schema validation (available for structured validation beyond YAML) |
+| **pytest** | >=7.0 (dev) | Test runner for script unit tests |
+| **pytest-cov** | >=4.0 (dev) | Coverage reporting for pytest |
+| **Python** | >=3.12 | Required for modern type hint syntax (`Path \| None`, `list[str]`) |
+
+**Build system:** Hatchling (`hatchling.build`)
+
+**Test configuration:** Tests live in `scripts/tests/`, run with `uv run pytest` or `uv run pytest --cov`.
+
+---
+
+## 5. Error Handling
+
+All scripts follow consistent error handling conventions:
+
+- **Errors to stderr:** Critical errors are written to `sys.stderr` (some scripts use `print(..., file=sys.stderr)`)
+- **Structured messages:** Error messages include file paths and field names for easy debugging:
+  ```
+  Error: State file not found: /path/to/.sdlc/state.yaml
+  Error: requirements.md not found or empty in 01-requirements/
+  company: missing required field 'profile_id'
+  ```
+- **Non-zero exit codes:** All failures produce exit code `1` (or `2` for configuration errors in `advance_phase.py`), propagated to the calling command
+- **Graceful degradation:** Where possible, scripts continue with warnings rather than hard failures:
+  - `init_project.py` warns and skips if `.sdlc/` exists
+  - `synthesize_spec.py` treats Phase 0 artifacts as optional
+  - `map_deep_plan_artifacts.py` warns on missing section files and skips them
+  - `generate_phase_report.py` shows placeholder sections for missing artifacts
+- **YAML round-trip safety:** State updates use `yaml.dump()` with `default_flow_style=False` and `allow_unicode=True` to preserve human readability
+
+---
+
+## 6. Cross-References
+
+| Document | Relationship |
+|----------|-------------|
+| [commands.md](commands.md) | Documents which slash commands invoke which scripts |
+| [gate-system.md](gate-system.md) | Detailed gate semantics and severity rules |
+| [architecture.md](architecture.md) | Overall plugin architecture and data flow |
+| [profiles.md](profiles.md) | Profile YAML structure and schema reference |
+| `phases/phase-registry.yaml` | Phase definitions consumed by `check_gates.py` and `advance_phase.py` |
+| `scripts/phase_model.py` | Single source of truth for phase ids, order, and slugs (reads `phase-registry.yaml`) |
+| `profiles/_schema.yaml` | Schema consumed by `validate_profile.py` |
+| `templates/state-init.yaml` | State template consumed by `init_project.py` |
+| `templates/phases/03-foundation/section-plans/SECTION-template-deep-plan.md` | Converged template consumed by `map_deep_plan_artifacts.py` |
+

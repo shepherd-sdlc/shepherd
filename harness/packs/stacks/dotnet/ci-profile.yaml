@@ -1,0 +1,172 @@
+# .NET CI command profile — the interface a CI/CD pack consumes.
+#
+# A CI/CD pack (packs/cicd/github, packs/cicd/azure-devops) reads these values and realizes them into
+# its platform's pipeline syntax. This is MECHANICAL, not a copy-by-hand: the installer builds a
+# `<<CI_*>>` token table from this file plus the CI/CD pack's `toolchain_map:` and substitutes it into
+# every file that pack overlays. An unfilled token fails the install closed. The exact token each key
+# fills is noted below; the full contract is packs/README.md "The seam between the two".
+#
+# This file is a COMPOSE-TIME INPUT — it is never installed into the target repo. What lands there is
+# the realized pipeline carrying these values.
+#
+# The repo fills {{SOLUTION_OR_PROJECT}} during Phase 3 adaptation: it rides INSIDE the commands
+# below and passes through substitution untouched. Values here are the .NET reference commands,
+# harvested from a realized .NET pipeline (see HARVEST.md) and aligned to the standard's 80% floor.
+#
+# This is the REFERENCE profile: a new stack pack copies this shape, not these commands.
+
+toolchain:
+  # Which toolchain — NOT how to install it. Each CI/CD pack maps this id to its own platform's setup
+  # step via `toolchain_map:` in its pack.yaml (github → actions/setup-dotnet@v6 + `dotnet-version`;
+  # azure-devops → UseDotNet@2 + `version`). An id no CI/CD pack maps fails the install closed.
+  id: dotnet             # -> <<CI_TOOLCHAIN_ACTION>> / <<CI_TOOLCHAIN_INPUT>> (via toolchain_map)
+  version: "10.x"        # -> <<CI_TOOLCHAIN_VERSION>>
+
+solution: "{{SOLUTION_OR_PROJECT}}"   # e.g. src/YourApp.slnx — repo adaptation fills this
+
+# Each command MUST be a single line: the CI/CD pack splices it verbatim into one `run:`/`script:`
+# block scalar, so an embedded newline would emit an extra, unreviewed shell line. The installer
+# rejects a multi-line command. A folded '>-' scalar (see `test`) is single-line once loaded — the
+# line breaks are authoring convenience and fold back to spaces.
+#
+# `--results-directory coverage` is load-bearing: the CI/CD pack's coverage-floor step reads the
+# cobertura reports from `coverage/`. Change it here and that step must follow.
+commands:
+  restore: dotnet restore {{SOLUTION_OR_PROJECT}}                                      # -> <<CI_RESTORE_CMD>>
+  build:   dotnet build {{SOLUTION_OR_PROJECT}} --no-restore --configuration Release   # -> <<CI_BUILD_CMD>>
+  test:    >-
+    dotnet test {{SOLUTION_OR_PROJECT}}
+    --no-build --configuration Release
+    --collect:"XPlat Code Coverage" --results-directory coverage
+  lint:    dotnet format {{SOLUTION_OR_PROJECT}} --verify-no-changes                   # -> <<CI_LINT_CMD>>
+
+coverage:
+  # The standard's floor. ENFORCED BY THE PIPELINE: each CI/CD pack has an explicit post-test gate
+  # step that parses the cobertura reports and exits non-zero below this number (github ci.yml
+  # "Enforce coverage floor"; the ADO restore-build-test template's twin). It is NOT enforced via
+  # coverlet args — the XPlat collector supports Format/Include/Exclude but NOT threshold validation
+  # (that is a coverlet.msbuild feature), which is exactly why the pipeline owns the gate.
+  floor_percent: 80        # -> <<CI_COVERAGE_FLOOR>>
+  tool: coverlet           # informational: what produces the cobertura report the gate reads
+
+# Optional second hard gate — kept only when the repo ships agentic behavior that must not regress.
+# Realized by the CI/CD pack as an extra job/stage. Filter harvested from the reference repo.
+#
+# `command` is the WHOLE invocation, not a bare filter. An earlier design bound only the filter and
+# left `dotnet test ...` hardcoded in both CI/CD packs, which put a .NET runner on every stack: a
+# filter value is meaningless without the flag that consumes it, and that flag's syntax is
+# runner-specific. The command is the unit that crosses the seam.
+#
+# CONTRACT with the CI/CD packs: results are written into `eval-results/` (relative), which their
+# upload step publishes. Same shape as the `coverage/` contract.
+#
+# --no-build: the pack runs «commands.build» in the step before this one; rebuilding here would be
+# waste and could mask a build that only succeeds on a second pass. It REQUIRES the Release config
+# below to match the earlier build's.
+#
+# ── WHY TreatNoTestsAsError IS HERE. READ BEFORE REMOVING. ────────────────────────────────────────
+# `dotnet test --filter` matching ZERO tests exits 0 — "No test matches the given testcase filter"
+# is a WARNING. Verified empirically on SDK 8.0.129, 9.0.316 and 10.0.301: all three exit 0, and all
+# three still WRITE the trx, with Counters total="0" and outcome="Completed". Without the setting
+# below this gate passes green having run nothing — never trust the trx's existence as success.
+#
+# `RunConfiguration.TreatNoTestsAsError=true` makes zero-match exit 1. Verified on all three SDKs in
+# all three states: zero-match -> 1, matching filter -> 0, genuinely failing fixture -> 1. So it
+# fails closed on "nobody tagged it" AND on "a fixture regressed", without false-failing a healthy
+# run. It is a runsettings value, so it MUST come after `--` and `--` MUST come last.
+# Docs: learn.microsoft.com/visualstudio/test/configure-unit-tests-by-using-a-dot-runsettings-file
+# ("Value that specifies the exit code when no tests are discovered").
+# NOTE `/p:FailIfNoTestsFound` and `/FailWhenNoTestsFound` do NOT exist — do not reach for them.
+# Microsoft.Testing.Platform fails closed natively (exit 8 = zero tests ran) and needs no setting,
+# but this reference targets classic VSTest `dotnet test`, which does not.
+#
+# ── FILTER SYNTAX IS TEST-FRAMEWORK SPECIFIC ──────────────────────────────────────────────────────
+# `Category=` is xUnit's trait key. MSTest and NUnit spell it `TestCategory=`. On MSTest a
+# `Category=` filter matches zero tests EVEN WHEN every fixture is correctly tagged (verified) —
+# which, before the setting above, was a silent green. If your eval project is not xUnit, change
+# this key. This is a Phase-3 adaptation like <<EVAL_TEST_PROJECT>>, not a stack-wide truth.
+eval_gate:
+  enabled: false
+  # -> <<CI_EVAL_CMD>>. <<EVAL_TEST_PROJECT>> is a Phase-3 repo blank riding inside this command:
+  # the installer substitutes the command, and the blank lands in the workflow for the repo to fill.
+  command: >-
+    dotnet test <<EVAL_TEST_PROJECT>>
+    --no-build --configuration Release
+    --filter "Category=OwaspAgentic"
+    --logger "trx;LogFileName=eval-gate.trx"
+    --results-directory eval-results
+    -- RunConfiguration.TreatNoTestsAsError=true
+
+# ── DEPENDENCY SCAN — the third-party-component position (GOLD-STANDARD §7) ───────────────────────
+# Realized by the CI/CD pack as TWO things from this one declaration: a diff-scoped `dependency-gate`
+# job in ci.yml (blocks a PR that INTRODUCES a vulnerable package) and a weekly full scan that raises
+# an issue for what is already there.
+#
+# ── WHY THE GATE IS DIFF-SCOPED, AND WHY THAT IS NOT A WEAKENING ─────────────────────────────────
+# Every other gate here measures the DIFF. A vulnerability scan measures the whole repo, so a CVE
+# published overnight in a package nobody touched would redden every open PR the next morning. That
+# is the failure deploy-dev.yml's header argues against at length: a job red for reasons nobody
+# caused teaches the team that red is normal, which degrades the signal on every OTHER job. So the
+# gate blocks on what THIS CHANGE introduced, and the scheduled scan owns the standing stock — which
+# rides the normal rails as an ordinary spec, with a human deciding the priority.
+#
+# ── THE CONTRACT (read before changing `command`) ────────────────────────────────────────────────
+# `command` MUST print ONE FINDING PER LINE as TSV:
+#
+#     <severity>\t<package-id>\t<resolved-version>\t<advisory-url>
+#
+# and print NOTHING ELSE. It must exit 0 whether or not findings exist — findings are DATA here, not
+# failure; the pack decides what blocks. Normalizing HERE, in the stack pack, is deliberate: it keeps
+# the CI/CD packs from having to learn three unrelated JSON schemas, which is the same reason
+# `commands.*` are declared here rather than hardcoded per platform. The pack just runs this on the
+# base tree and on the head tree and compares the two sets of lines.
+#
+# ── VERIFIED EMPIRICALLY, 2026-07-31, SDK 11.0.100-preview.1 ─────────────────────────────────────
+# Probe: a net8.0 classlib with System.Net.Http 4.3.0 (a real, published High advisory).
+#
+#   *** `dotnet list package --vulnerable` EXITS 0 WITH A HIGH VULNERABILITY PRESENT. ***
+#
+# Confirmed by running it. A CI step that trusts the exit code reports GREEN while the project ships
+# a known-vulnerable package. This is the same shape of trap as `dotnet test --filter` matching zero
+# tests (see eval_gate above) — the tool tells you in its OUTPUT, never in its status. Findings must
+# be parsed, never inferred from success. Do not "simplify" this to `&& echo ok`.
+#
+# Verified JSON shape (`--output-version 1`), which the jq below walks:
+#   .projects[].frameworks[].topLevelPackages[]   -> {id, requestedVersion, resolvedVersion,
+#                                                     vulnerabilities:[{severity, advisoryurl}]}
+#   .projects[].frameworks[].transitivePackages[] -> same shape (only topLevelPackages appeared in
+#                                                     the probe; the transitive key is handled too
+#                                                     because --include-transitive is set)
+#
+# `--output-version 1` is PINNED ON PURPOSE. Microsoft documents that when a new JSON version ships,
+# the command produces the NEW format by default — which would silently change every field the jq
+# reads. An unpinned parser is a parser that breaks on an SDK bump, quietly, in the passing direction.
+#
+# `--include-transitive` is NOT the default, and NuGet's own CI guidance calls this out. Without it
+# the scan sees only what you referenced directly, which is where the minority of real CVEs live.
+#
+# `--vulnerable` needs SDK >= 9.0.300; `--format json` needs >= 7.0.200. Both satisfied by the 10.x
+# pinned above. Vulnerability data comes from `<AuditSources>`, defaulting to the configured
+# `<PackageSources>` — an offline or mirror-only feed that lacks VulnerabilityInfoResource yields NO
+# findings and warns rather than failing, so on a private-feed client CONFIRM the audit source
+# resolves before trusting a green gate.
+#
+# NOTE the command rename: .NET 10 introduced the noun-first `dotnet package list`. The verb-first
+# form below still works and also works on 9.x, so it is the portable spelling. Do not "modernize" it
+# without checking the SDK floor of every repo using this profile.
+dependency_scan:
+  enabled: true
+  # -> <<CI_DEPENDENCY_SCAN_CMD>>. Single line, like every other command here.
+  command: >-
+    dotnet list package --vulnerable --include-transitive --format json --output-version 1
+    | jq -r '.projects[]?.frameworks[]? | (.topLevelPackages[]?, .transitivePackages[]?) | . as $p | ($p.vulnerabilities[]? | [.severity, $p.id, $p.resolvedVersion, .advisoryurl] | @tsv)'
+  # -> <<CI_DEPENDENCY_BLOCK_SEVERITIES>>. Compared case-insensitively against field 1. Anything not
+  # listed is reported and does not block, matching security.yml's "blocks on HIGH" dial. NuGet renders
+  # severity as words; only High/Critical are load-bearing here, so the exact spelling of the middle
+  # tier (Moderate vs Medium — not observed in the probe) cannot change the outcome.
+  block_severities: "High,Critical"
+
+# Feeds profile.quality.session_health_check when the CI/CD pack / hooks wire a session-start smoke test.
+session_health:
+  command: dotnet build {{SOLUTION_OR_PROJECT}} --no-restore --verbosity quiet
+  timeout_seconds: 120

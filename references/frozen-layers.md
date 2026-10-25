@@ -1,0 +1,122 @@
+# Phase Layers Reference (formerly "frozen layers")
+
+Phase layers are token-efficient condensed summaries of a phase's artifacts. They enable cross-phase context continuity without reloading full artifacts. The file name of this reference, the template (`templates/frozen-layer.md`), the validator (`validate_frozen_layer.py`) and the metrics log keep the historical "frozen" name for compatibility; the layers themselves are **living summaries** — regenerated whenever the artifacts they summarise change (see "Living, not frozen" below).
+
+## When Generated
+
+- **At a phase advance** — after all phase gates pass and the user gives HITL sign-off, but **before** `advance_phase.py` runs. The `/sprd-next` command orchestrates this (step 5).
+- **Whenever a source artifact changes afterwards** — a requirement sharpened, a business rule corrected, an ADR gaining a consequence. The layer for that phase is regenerated along with the change (see "Living, not frozen" below).
+
+## Token Budget
+
+| Constraint | Value |
+|-----------|-------|
+| Target | 1500–2000 tokens |
+| Hard minimum | 1000 tokens |
+| Hard maximum | 2500 tokens |
+| Estimation | word_count × 1.3 (used by both Claude and the validator) |
+
+## Output Location
+
+```
+.sdlc/context/layers/phase{id}-{name}.md
+```
+
+`{id}` is the phase id from the registry, which may be non-numeric. Examples: `phase0-discovery.md`, `phase1-requirements.md`, `phase3-foundation.md`, `phasebuild-build.md`, `phaseclose-close.md`.
+
+Layers are ordered by the registry's lifecycle `order` (`0 → 1 → 2 → 3 → build → 7 → 8 → 9 → close`), not by a lexical sort of the filenames — `phasebuild-build.md` sorts before `phase7-documentation.md` lexically but comes after it in the lifecycle.
+
+## Template
+
+Use `templates/frozen-layer.md` from the plugin directory. The template provides YAML frontmatter and section structure. Claude fills in the content by reading all artifacts from the phase **as they are now**.
+
+## Mandatory Sections
+
+### 1. Decision
+The gate decision (GO/CONDITIONAL_GO) with score and any conditions.
+
+### 2. Key Outcomes
+2-3 bullet points summarizing what this phase produced. Focus on decisions made and artifacts created, not process steps taken.
+
+### 3. Locked Metrics
+Explicit values for budget, timeline, scope, and stakeholders — ONLY if established in this phase. The heading is read **literally** by the G5-consistency gate in `check_gates.py` (protected), so it keeps its name. Read "locked" as *carried forward and re-checked*: these values are compared against later-phase artifacts; a change to one of them needs a decision-log entry, and the layer is regenerated so the new value is what G5 compares against.
+
+### 4. Constraints Carried Forward
+Non-negotiable constraints that affect downstream phases. Include technology constraints, compliance requirements, and organizational boundaries.
+
+### 5. Risks & Mitigations
+Active risks with severity, current mitigation status, and whether they're resolved or carried forward.
+
+### 6. Artifact Summary
+One-line summary per major artifact produced in the phase.
+
+### 7. Traceability Footer
+Maps each source artifact to the sections extracted from it. This enables verification — every claim in the layer traces to a specific artifact.
+
+
+## Condensation Strategy
+
+Priority order when approaching the token budget:
+1. **Locked Metrics** — always include, never cut
+2. **Constraints** — include all non-negotiable constraints
+3. **Risks** — include active/unresolved risks; omit fully mitigated ones
+4. **Key Outcomes** — condense to shorter bullets if needed
+5. **Artifact Summary** — omit optional artifacts first
+
+### Good Condensation
+
+- "Budget: $50K, approved by CTO, covers MVP only" (specific, traceable)
+- "Must support 1000 concurrent users (NFR-003)" (ties to requirement ID)
+
+### Bad Condensation
+
+- "Budget was discussed and a number was agreed upon" (vague, no value)
+- "Performance requirements exist" (no specifics, useless downstream)
+
+## Validation
+
+After generating or regenerating, run:
+```bash
+uv run --project ${CLAUDE_PLUGIN_ROOT}/scripts ${CLAUDE_PLUGIN_ROOT}/scripts/validate_frozen_layer.py \
+  --state .sdlc/state.yaml --phase <N>
+```
+
+The validator checks: file exists, YAML frontmatter is parseable, required fields present, token estimate within range, traceability references exist.
+
+## Token Estimation
+
+Claude cannot directly count tokens. Use **word count × 1.3** as the estimation formula. The validator (`validate_frozen_layer.py`) uses the same formula, ensuring consistency between what Claude declares in the `estimated_tokens` frontmatter field and what the validator checks.
+
+## Living, not frozen
+
+A layer is a **summary of its sources**, not a lock on them. Earlier-phase artifacts are expected to change after the phase advanced — a requirement gets sharpened while a sprint's spec is refined, a business rule is corrected, an ADR gains a consequence. When that happens the layer must change too, or every later session starts from a summary that is no longer true.
+
+The rule, therefore:
+
+| When a source artifact changes | What happens to the layer |
+|---|---|
+| At the next `/sprd-next` of that phase (re-entry) | Regenerated as part of step 5, as always |
+| Any other change to a source artifact | Regenerate the layer by the procedure below |
+
+
+What stays true:
+
+- **Immutable history, mutable current.** The previous version is kept as `phase{N}-{name}.md.superseded-<YYYYMMDD>` — never loaded by the session-start hook (its `phase*.md` glob does not match), always available for audit.
+- **Sign-offs are never rewritten.** The gate sign-off recorded in `state.yaml` for the phase stays exactly as it was. The changed artifact shows as *modified since snapshot* in `check_gates.py --phase N` (dirty tracking). Integrity comes from the record, not from forbidding the change.
+- **`current_phase` never moves.** Regenerating a layer, like revising an artifact, is a check-and-record, not a transition.
+
+## Regeneration procedure
+
+1. Rename the current layer to `phase{N}-{name}.md.superseded-<YYYYMMDD>`.
+2. Re-condense from the **current** artifacts of that phase using `templates/frozen-layer.md` (same procedure as `/sprd-next` step 5; keep `gate_decision` and `gate_summary` from the original sign-off — they describe the gate that was passed, which did not change).
+3. Validate with `validate_frozen_layer.py --phase N`.
+
+## Upgrading Existing Projects
+
+If your project was initialized before layer support, the `.sdlc/context/` directory won't exist. Create it manually:
+
+```bash
+mkdir -p .sdlc/context/layers
+```
+
+Layers will be generated on the next `/sprd-next` phase transition. The session-start hook gracefully handles the absence of layers — it simply skips Tier 2 loading. Projects with a single `phase{N}-{name}.md.superseded` file from the older convention need nothing changed; new regenerations use the dated suffix.

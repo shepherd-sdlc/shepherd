@@ -1,0 +1,769 @@
+"""Check exit criteria (gates) for a given SDLC phase."""
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import yaml
+
+PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).parent))
+import phase_model as pm
+import track_specs
+
+
+def load_yaml(path: Path) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
+def get_phase_registry() -> dict:
+    return load_yaml(PLUGIN_ROOT / "phases" / "phase-registry.yaml")
+
+
+def get_compliance_gates(profile: dict) -> list[dict]:
+    """Load compliance gates for the profile's frameworks."""
+    gates = []
+    frameworks = profile.get("compliance", {}).get("frameworks", [])
+    profile_id = profile["company"]["profile_id"]
+    profile_dir = PLUGIN_ROOT / "profiles" / profile_id / "compliance"
+
+    for fw in frameworks:
+        gate_file = profile_dir / f"{fw}-gates.yaml"
+        if gate_file.exists():
+            data = load_yaml(gate_file)
+            gates.extend(data.get("gates", []))
+    return gates
+
+
+def check_artifact_exists(artifacts_dir: Path, artifact: str) -> tuple[bool, str]:
+    path = artifacts_dir / artifact
+    if path.exists():
+        if path.is_dir():
+            children = list(path.iterdir())
+            if children:
+                return True, f"Directory '{artifact}' exists with {len(children)} item(s)"
+            return False, f"Directory '{artifact}' exists but is empty"
+        return True, f"File '{artifact}' exists"
+    return False, f"Missing: '{artifact}'"
+
+
+def check_artifact_not_empty(artifacts_dir: Path, artifact: str) -> tuple[bool, str]:
+    path = artifacts_dir / artifact
+    if not path.exists():
+        return False, f"Missing: '{artifact}'"
+    if path.is_dir():
+        return bool(list(path.iterdir())), f"Directory '{artifact}' emptiness check"
+    content = path.read_text(encoding="utf-8", errors="replace").strip()
+    if not content:
+        return False, f"File '{artifact}' is empty"
+    return True, f"File '{artifact}' has content ({len(content)} chars)"
+
+
+PLACEHOLDER_MARKERS = ["TODO", "TBD", "${", "PLACEHOLDER", "[INSERT", "<!-- REQUIRED:"]
+
+# A required receipt records human work no command can perform. Some of it genuinely will not
+# happen on a given engagement — there is no live carrier API to spike against, the client has no
+# ops engineer to walk the RUNBOOK. A gate with no escape gets worked around, and the workaround is
+# invisible; so the escape is built in, and made loud.
+#
+# The waiver lives IN the artifact: the file exists and names who waived it and why. That keeps the
+# record honest about what was skipped, the same way the eval-bypass ledger does. What it must never
+# do is pass silently — a quiet gate exception is how a gate stops being a gate.
+# Deliberately forgiving about the separator between the name and the reason — em dash, en dash,
+# hyphen, comma or colon. A human types this line by hand under pressure; a waiver that fails to
+# parse would block the gate for a punctuation choice, and the next person's fix would be to delete
+# the gate rather than the comma.
+WAIVER_RE = re.compile(
+    # Markdown emphasis may close before or after the colon (`**WAIVED**:` / `**WAIVED:**`), and
+    # both are what people actually type.
+    r"^\s*(?:[-*>]\s*)?(?:\*\*)?WAIVED(?:\*\*)?\s*:\s*(?:\*\*)?\s*"
+    r"(?P<who>[^—–,:\-\n]+?)\s*[—–,:\-]+\s*(?P<why>\S.*)$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def waiver_in(path: Path) -> tuple[str, str] | None:
+    """The (who, why) of a waiver recorded in this artifact, or None.
+
+    Both halves are required. `WAIVED: because we ran out of time` names nobody, and an
+    unattributable waiver is the thing being prevented.
+    """
+    if path.is_dir() or not path.exists():
+        return None
+    m = WAIVER_RE.search(path.read_text(encoding="utf-8", errors="replace"))
+    if not m:
+        return None
+    who, why = m.group("who").strip(), m.group("why").strip()
+    return (who, why) if who and why else None
+
+
+def _placeholders_in(path: Path) -> list[str]:
+    content = path.read_text(encoding="utf-8", errors="replace")
+    return [p for p in PLACEHOLDER_MARKERS if p in content]
+
+
+def check_artifact_complete(artifacts_dir: Path, artifact: str) -> tuple[bool, str]:
+    """Check artifact exists, is non-empty, and has no placeholder content.
+
+    A DIRECTORY artifact is checked through to its files. It used to pass on merely being
+    non-empty, which made `adrs/` satisfiable by a single ADR that was nothing but headings and
+    TODOs — the phase whose output is the signed record of why the system is shaped this way
+    could close on a folder with no decisions in it. If a file with a TODO fails, a directory of
+    them cannot pass.
+    """
+    exists, msg = check_artifact_not_empty(artifacts_dir, artifact)
+    if not exists:
+        return False, msg
+
+    path = artifacts_dir / artifact
+    if path.is_dir():
+        files = [f for f in sorted(path.rglob("*")) if f.is_file()]
+        if not files:
+            return False, f"Directory '{artifact}' contains no files"
+        empty = [f.name for f in files if not f.read_text(encoding="utf-8", errors="replace").strip()]
+        if empty:
+            return False, f"Directory '{artifact}' contains empty file(s): {empty}"
+        incomplete = {f.name: _placeholders_in(f) for f in files}
+        incomplete = {n: p for n, p in incomplete.items() if p}
+        if incomplete:
+            detail = ", ".join(f"{n} {p}" for n, p in incomplete.items())
+            return False, f"Directory '{artifact}' contains placeholder content: {detail}"
+        return True, f"Directory '{artifact}' is complete ({len(files)} file(s))"
+
+    found = _placeholders_in(path)
+    if found:
+        return False, f"File '{artifact}' contains placeholder content: {found}"
+    return True, f"File '{artifact}' is complete"
+
+
+def check_exit_criteria(phase_def: dict) -> list[dict]:
+    """Surface the phase's declared prose exit conditions as human-review items.
+
+    `exit_gate.conditions[]` holds two shapes:
+
+      - {"artifact": "design-doc.md", "check": "exists_and_complete"}  -> machine-checked by G1/G2
+      - {"check": "The rails are proven, not just present"}            -> a human's judgment
+
+    Only the second shape is returned here, one result per condition, always with
+    `passed: None` so it renders as REVIEW and is picked up by `advance_phase.py`'s
+    manual-gate handling. These never fail and never block: a MUST failure is what
+    stops an advance, and a condition nobody evaluated cannot have failed.
+    """
+    conditions = (phase_def.get("exit_gate") or {}).get("conditions") or []
+    results = []
+    for condition in conditions:
+        if not isinstance(condition, dict) or "artifact" in condition:
+            continue
+        check = condition.get("check")
+        if not check:
+            continue
+        results.append({
+            "gate": "G7-exit-criteria",
+            "passed": None,
+            "message": f"Human verification required: {check}",
+            "severity": "MUST",
+        })
+    return results
+
+
+def check_cross_references(artifacts_dir: Path) -> list[dict]:
+    """Check that file references within artifacts resolve to existing files."""
+    import re
+
+    results = []
+    if not artifacts_dir.exists():
+        return results
+
+    # Collect all artifact filenames in the sdlc directory tree
+    sdlc_dir = artifacts_dir.resolve().parent
+    existing_files = set()
+    for fp in sdlc_dir.rglob("*"):
+        if fp.is_file():
+            existing_files.add(fp.name)
+            existing_files.add(str(fp.relative_to(sdlc_dir)).replace("\\", "/"))
+
+    # Also collect files from the project root (parent of .sdlc/)
+    # artifacts_dir is .sdlc/artifacts/NN-name, so project root is 3 levels up
+    # sdlc_dir (artifacts_dir.resolve().parent) = .sdlc/artifacts
+    # sdlc_dir.parent = .sdlc/
+    # sdlc_dir.parent.parent = project root
+    project_root = sdlc_dir.parent.parent
+    project_files = set()
+    for fp in project_root.rglob("*"):
+        if fp.is_file():
+            rel = str(fp.relative_to(project_root)).replace("\\", "/")
+            # Skip .sdlc/ files (already indexed above) and .git/
+            if rel.startswith(".sdlc/") or rel.startswith(".git/"):
+                continue
+            project_files.add(fp.name)
+            project_files.add(rel)
+
+    # rglob may skip dotfiles on some platforms — explicitly walk .claude/ if it exists
+    dot_claude = project_root / ".claude"
+    if dot_claude.exists():
+        for fp in dot_claude.rglob("*"):
+            if fp.is_file():
+                rel = str(fp.relative_to(project_root)).replace("\\", "/")
+                project_files.add(fp.name)
+                project_files.add(rel)
+
+    # Scan each markdown artifact for file references
+    for artifact_path in sorted(artifacts_dir.rglob("*.md")):
+        content = artifact_path.read_text(encoding="utf-8", errors="replace")
+        artifact_name = artifact_path.name
+
+        # Find markdown-style references and backtick references to .md/.yaml/.json files
+        refs = re.findall(
+            r'(?:`([^`]+\.(?:md|yaml|json|html))`'
+            r'|\[[^\]]*\]\(([^)]+\.(?:md|yaml|json|html))\))',
+            content,
+        )
+        for groups in refs:
+            ref = groups[0] or groups[1]
+            # Strip leading paths like .sdlc/ or artifacts/
+            ref_name = ref.split("/")[-1] if "/" in ref else ref
+            # Check in .sdlc/ tree, then in project root tree
+            if (ref_name not in existing_files and ref not in existing_files
+                    and ref_name not in project_files and ref not in project_files):
+                # Skip known external/template refs
+                if ref.startswith("http") or "${" in ref or ref.startswith("<"):
+                    continue
+                results.append({
+                    "gate": "cross-reference",
+                    "passed": False,
+                    "message": f"'{artifact_name}' references '{ref}' which was not found in project",
+                    "severity": "SHOULD",
+                })
+
+    return results
+
+
+def compute_checksum(file_path: Path) -> str:
+    """Compute SHA-256 hash of a file (first 16 hex chars)."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return f"sha256:{h.hexdigest()[:16]}"
+
+
+def get_dirty_artifacts(
+    phase_id, state: dict, artifacts_dir: Path
+) -> dict[str, list[str]]:
+    """Compare stored checksums to current files. Returns categorized lists."""
+    stored = state.get("phases", {}).get(pm.normalize_id(phase_id), {}).get("artifact_checksums", {})
+    if not stored or not artifacts_dir.exists():
+        return {"new": [], "modified": [], "unchanged": [], "deleted": []}
+
+    current = {}
+    for fp in sorted(artifacts_dir.rglob("*")):
+        if fp.is_file():
+            rel = str(fp.relative_to(artifacts_dir)).replace("\\", "/")
+            current[rel] = compute_checksum(fp)
+
+    stored_files = set(stored.keys())
+    current_files = set(current.keys())
+    common = stored_files & current_files
+
+    return {
+        "new": sorted(current_files - stored_files),
+        "modified": sorted(f for f in common if stored[f] != current[f]),
+        "unchanged": sorted(f for f in common if stored[f] == current[f]),
+        "deleted": sorted(stored_files - current_files),
+    }
+
+
+def check_intake_consistency(sdlc_dir: Path) -> list[dict]:
+    """Verify document intake artifacts are consistent (Phase 0 only)."""
+    results = []
+    catalog_path = sdlc_dir / "context" / "intake" / "catalog.json"
+
+    if not catalog_path.exists():
+        return results  # No intake performed — skip entirely
+
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        results.append({
+            "gate": "G2-completeness",
+            "artifact": "document-intake",
+            "passed": False,
+            "message": "catalog.json exists but is malformed",
+            "severity": "SHOULD",
+        })
+        return results
+
+    docs = catalog.get("documents", [])
+    intake_dir = sdlc_dir / "context" / "intake"
+
+    # Check each cataloged document has a summary
+    missing_summaries = []
+    for doc in docs:
+        doc_id = doc["doc_id"]
+        matches = list(intake_dir.glob(f"{doc_id}-*.md"))
+        if not matches:
+            missing_summaries.append(doc_id)
+
+    if missing_summaries:
+        results.append({
+            "gate": "G2-completeness",
+            "artifact": "document-intake",
+            "passed": False,
+            "message": f"Missing summaries for {len(missing_summaries)} document(s): {missing_summaries[:5]}",
+            "severity": "SHOULD",
+        })
+    else:
+        results.append({
+            "gate": "G2-completeness",
+            "artifact": "document-intake",
+            "passed": True,
+            "message": f"All {len(docs)} cataloged documents have summaries",
+            "severity": "SHOULD",
+        })
+
+    # Check summary token budgets
+    summary_budget = catalog.get("summary_budget_tokens", 750)
+    oversized = []
+    for doc in docs:
+        doc_id = doc["doc_id"]
+        matches = list(intake_dir.glob(f"{doc_id}-*.md"))
+        for match in matches:
+            word_count = len(match.read_text(encoding="utf-8", errors="replace").split())
+            est_tokens = int(word_count * 1.3)
+            if est_tokens > summary_budget * 1.5:
+                oversized.append(f"{doc_id} ({est_tokens} tokens, budget {summary_budget})")
+
+    if oversized:
+        results.append({
+            "gate": "G6-quality",
+            "artifact": "document-summaries",
+            "passed": False,
+            "message": f"{len(oversized)} summary(s) exceed token budget by >50%: {oversized[:3]}",
+            "severity": "SHOULD",
+        })
+
+    # Check index.md exists
+    index_path = intake_dir / "index.md"
+    if not index_path.exists():
+        results.append({
+            "gate": "G2-completeness",
+            "artifact": "intake-index",
+            "passed": False,
+            "message": "Intake index (.sdlc/context/intake/index.md) not found",
+            "severity": "SHOULD",
+        })
+
+    return results
+
+
+def check_phase_gates(
+    phase_id,
+    state: dict,
+    profile: dict,
+    artifacts_base: Path,
+) -> list[dict]:
+    """Run all gate checks for a phase. Returns list of results."""
+    phase_id = pm.normalize_id(phase_id)
+    results = []
+
+    # Find phase definition in registry (single source of truth)
+    phase_def = pm.get_phase(phase_id)
+
+    if not phase_def:
+        return [{"gate": "registry", "passed": False, "message": f"Phase {phase_id} not found in registry"}]
+
+    artifacts_dir = artifacts_base / phase_def["slug"]
+
+    # Some required artifacts are the repo's real files, not copies under .sdlc/ — the README a
+    # stranger actually clones and follows. artifacts_base is <repo>/.sdlc/artifacts.
+    repo_root = artifacts_base.resolve().parent.parent
+
+    # Phase 0 records the project type; five phase bodies adapt their artifacts to it, and the
+    # gate must adapt with them or it blocks on documents those bodies said to skip.
+    project_type = state.get("project_type")
+    required = pm.required_artifacts(phase_def, project_type)
+
+    skipped = [
+        a for a in pm.required_artifacts(phase_def, None)
+        if not a.applies_to(project_type)
+    ]
+    for artifact in skipped:
+        results.append({
+            "gate": "G1-integrity",
+            "artifact": artifact.name,
+            "passed": True,
+            "message": f"N/A — {project_type}: '{artifact.name}' is not required for this project type",
+            "severity": "INFO",
+        })
+
+    # Dirty tracking — identify changed artifacts for incremental validation
+    dirty = get_dirty_artifacts(phase_id, state, artifacts_dir)
+    unchanged_set = set(dirty["unchanged"])
+    has_baseline = bool(
+        state.get("phases", {}).get(phase_id, {}).get("artifact_checksums")
+    )
+
+    if has_baseline:
+        n_new = len(dirty["new"])
+        n_mod = len(dirty["modified"])
+        n_unch = len(dirty["unchanged"])
+        results.append({
+            "gate": "dirty-tracking",
+            "passed": True,
+            "message": f"Artifacts: {n_new} new, {n_mod} modified, {n_unch} unchanged (skipping unchanged)",
+            "severity": "INFO",
+        })
+
+    # Gate 1: Artifact Integrity — required artifacts exist
+    for artifact in required:
+        base = artifact.base_dir(artifacts_dir, repo_root)
+        passed, message = check_artifact_exists(base, artifact.name)
+        results.append({
+            "gate": "G1-integrity",
+            "artifact": artifact.name,
+            "passed": passed,
+            "message": message,
+            "severity": "MUST",
+        })
+
+    # Gate 2: Completeness — required artifacts are complete
+    for artifact in required:
+        base = artifact.base_dir(artifacts_dir, repo_root)
+
+        # A waiver is checked BEFORE completeness: a waived receipt is deliberately not filled in,
+        # so judging it on placeholders would fail it for being exactly what it says it is. It is
+        # reported at INFO with the name attached — visible in the report the approver signs
+        # against, never a silent pass.
+        waiver = waiver_in(base / artifact.name)
+        if waiver:
+            who, why = waiver
+            results.append({
+                "gate": "G2-completeness",
+                "artifact": artifact.name,
+                "passed": True,
+                "message": f"WAIVED by {who} — {why}",
+                "severity": "INFO",
+            })
+            continue
+
+        # Dirty tracking only ever indexed the phase's own artifact dir, so a repo-root file has
+        # no baseline to be "unchanged" against and must be checked every time.
+        if has_baseline and artifact.root == "phase" and artifact.name in unchanged_set:
+            results.append({
+                "gate": "G2-completeness",
+                "artifact": artifact.name,
+                "passed": True,
+                "message": f"File '{artifact.name}' unchanged since last check (skipped)",
+                "severity": "MUST",
+            })
+            continue
+        passed, message = check_artifact_complete(base, artifact.name)
+        results.append({
+            "gate": "G2-completeness",
+            "artifact": artifact.name,
+            "passed": passed,
+            "message": message,
+            "severity": "MUST",
+        })
+
+    # Cross-artifact reference validation
+    xref_results = check_cross_references(artifacts_dir)
+    results.extend(xref_results)
+
+    # Gate 7: Exit criteria — the phase's declared conditions, rendered for the human who signs.
+    #
+    # The registry has always carried these. Nothing read them, so the approver was shown a list of
+    # files that exist and contain no placeholders, then asked to approve — without ever seeing the
+    # checklist they were approving against. They are deliberately not machine-checked: "the rails
+    # are proven, not just present" is a judgment, and a spike is a person touching a live system.
+    # Reported, never enforced. Gates report; humans decide.
+    results.extend(check_exit_criteria(phase_def))
+
+    # Build loop: spec-backlog summary (the spec is the unit of work; progress derives from
+    # spec frontmatter, not a separate tracker). Informational — the loop has no batch gate.
+    if phase_id == "build":
+        repo_root = artifacts_dir.resolve().parent.parent.parent  # .sdlc/artifacts/build -> repo root
+        specs = track_specs.scan_specs(repo_root / "specs")
+        summary = track_specs.summarize(specs)
+        by_status = summary["by_status"]
+        results.append({
+            "gate": "G2-completeness",
+            "artifact": "specs/",
+            "passed": None,
+            "message": (
+                f"Spec backlog: {summary['total']} spec(s) — "
+                f"{by_status.get('merged', 0)} merged, {by_status.get('in-flight', 0)} in-flight, "
+                f"{by_status.get('ready', 0)} ready, {by_status.get('draft', 0)} draft. "
+                f"Build is feature-complete by human declaration, not by this count."
+            ),
+            "severity": "INFO",
+        })
+
+    # Intake consistency (Discovery only)
+    if phase_id == "0":
+        intake_results = check_intake_consistency(artifacts_base.parent)
+        results.extend(intake_results)
+
+    # Gate 3: Metrics — coverage thresholds apply to the Build loop's per-change checking
+    if phase_id == "build":
+        quality = profile.get("quality", {})
+        results.append({
+            "gate": "G3-metrics",
+            "check": "coverage_minimum",
+            "passed": None,  # Requires external tool execution
+            "message": f"Coverage must be >= {quality.get('coverage_minimum', 80)}% (requires test execution)",
+            "severity": "MUST",
+        })
+
+    # Gate 4: Classification — compliance gates
+    compliance_gates = get_compliance_gates(profile)
+    phase_compliance = [g for g in compliance_gates if pm.normalize_id(g["phase"]) == phase_id]
+    for gate in phase_compliance:
+        if gate["check_type"] == "artifact_exists":
+            passed, message = check_artifact_exists(artifacts_dir, gate["artifact"])
+        elif gate["check_type"] == "artifact_content":
+            passed, message = check_artifact_complete(artifacts_dir, gate.get("artifact", ""))
+            # Additional content checks
+            if passed and "required_content" in gate:
+                path = artifacts_dir / gate["artifact"]
+                if path.exists() and path.is_file():
+                    content = path.read_text(encoding="utf-8", errors="replace").lower()
+                    missing = [kw for kw in gate["required_content"] if kw.lower() not in content]
+                    if missing:
+                        passed = False
+                        message = f"Missing required content in '{gate['artifact']}': {missing}"
+        elif gate["check_type"] == "manual":
+            passed = None
+            message = f"Manual check required: {gate.get('description', gate['name'])}"
+        elif gate["check_type"] == "metric":
+            passed = None
+            message = f"Metric check: {gate.get('metric', 'unknown')} (requires execution)"
+        else:
+            passed = None
+            message = f"Unknown check type: {gate['check_type']}"
+
+        results.append({
+            "gate": f"G4-compliance-{gate['id']}",
+            "name": gate["name"],
+            "passed": passed,
+            "message": message,
+            "severity": gate.get("severity", "MUST"),
+        })
+
+    # (The Build loop is spec-driven — one spec = one branch = one PR. Section-plan dependency-DAG
+    # enforcement was retired from the Build gate; check_dependencies.py is now a Phase-2 design aid.)
+
+    # Gate 5: Cross-phase consistency
+    sdlc_dir = artifacts_base.parent
+    consistency_results = check_cross_phase_consistency(phase_id, sdlc_dir)
+    results.extend(consistency_results)
+
+    # Gate 6: Phase-scoped evaluation criteria
+    eval_criteria = profile.get("quality", {}).get("evaluation_criteria", [])
+    phase_criteria = [
+        c for c in eval_criteria
+        if phase_id in [pm.normalize_id(p) for p in c.get("phases", ["build"])]
+    ]
+    if phase_criteria:
+        for criterion in phase_criteria:
+            # Evaluation criteria are checked by the agent (section-evaluator or gate reviewer),
+            # not mechanically. We record them as REVIEW items so the agent knows to check them.
+            results.append({
+                "gate": "G6-quality",
+                "check": criterion["name"],
+                "passed": None,  # Requires agent evaluation
+                "message": f"[{criterion.get('severity', 'warn').upper()}] {criterion['name']}: {criterion['description']}",
+                "severity": "MUST" if criterion.get("severity") == "fail" else "SHOULD",
+            })
+
+    return results
+
+
+def check_cross_phase_consistency(
+    phase_id,
+    sdlc_dir: Path,
+) -> list[dict]:
+    """G5: Check locked metrics against frozen layers from prior phases."""
+    results = []
+    phase_id = pm.normalize_id(phase_id)
+    layers_dir = sdlc_dir / "context" / "layers"
+
+    cur_order = pm.phase_order(phase_id)
+    if not layers_dir.exists() or cur_order is None or cur_order < 1:
+        return results  # No prior phases to check
+
+    # Collect frozen layer content for prior phases (compared by lifecycle order, not int id)
+    prior_layers = {}
+    for layer_file in sorted(layers_dir.glob("phase*.md")):
+        layer_id = layer_file.stem.split("-")[0].replace("phase", "")
+        if pm.get_phase(layer_id) is None:
+            continue
+        if pm.is_before(layer_id, phase_id):
+            prior_layers[layer_id] = layer_file.read_text(
+                encoding="utf-8", errors="replace"
+            )
+
+    if not prior_layers:
+        return results
+
+    # Check for locked metrics or constraints in frozen layers
+    locked_metrics_found = False
+    for content in prior_layers.values():
+        if "## Locked Metrics" in content or "## Constraints Carried Forward" in content:
+            locked_metrics_found = True
+            break
+
+    if not locked_metrics_found:
+        return results
+
+    # Check for decision log in current phase
+    current_phase_def = pm.get_phase(phase_id)
+    if not current_phase_def:
+        return results
+
+    current_artifacts_dir = sdlc_dir / "artifacts" / current_phase_def["slug"]
+    decision_log = current_artifacts_dir / "decision-log.md"
+
+    results.append({
+        "gate": "G5-consistency",
+        "passed": None,  # Manual check — Claude should compare values
+        "message": (
+            f"Cross-phase consistency: {len(prior_layers)} frozen layer(s) "
+            f"contain locked metrics. Verify current phase artifacts are "
+            f"consistent with prior constraints. "
+            f"Decision log {'exists' if decision_log.exists() else 'NOT FOUND — create one if any locked metrics changed'} "
+            f"at {decision_log.relative_to(sdlc_dir)}"
+        ),
+        "severity": "SHOULD",
+    })
+
+    return results
+
+
+def log_gate_metrics(results: list[dict], phase_id: int, sdlc_dir: Path) -> None:
+    """Append gate check results to .sdlc/metrics/gate-log.jsonl for empirical tracking."""
+    metrics_dir = sdlc_dir / "metrics"
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    log_path = metrics_dir / "gate-log.jsonl"
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    passed = sum(1 for r in results if r["passed"] is True)
+    failed = sum(1 for r in results if r["passed"] is False)
+    manual = sum(1 for r in results if r["passed"] is None)
+
+    # Log summary entry
+    entry = {
+        "timestamp": timestamp,
+        "phase": phase_id,
+        "passed": passed,
+        "failed": failed,
+        "manual": manual,
+        "blocked": any(
+            r["passed"] is False and r.get("severity") == "MUST"
+            for r in results
+        ),
+    }
+
+    # Log individual failures for analysis
+    failures = [
+        {"gate": r["gate"], "message": r["message"], "severity": r.get("severity", "")}
+        for r in results
+        if r["passed"] is False
+    ]
+    if failures:
+        entry["failures"] = failures
+
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def format_results(results: list[dict], phase_id: int) -> str:
+    lines = [f"Gate Check Results — Phase {phase_id}", "=" * 50]
+    passed = sum(1 for r in results if r["passed"] is True)
+    failed = sum(1 for r in results if r["passed"] is False)
+    manual = sum(1 for r in results if r["passed"] is None)
+    info = sum(1 for r in results if r.get("severity") == "INFO")
+    total = len(results)
+
+    # Group results by gate for compliance-checklist style output
+    gate_groups: dict[str, list[dict]] = {}
+    for r in results:
+        gate = r["gate"]
+        gate_groups.setdefault(gate, []).append(r)
+
+    for gate, gate_results in gate_groups.items():
+        lines.append(f"\n  [{gate}]")
+        for r in gate_results:
+            if r["passed"] is True:
+                status = "COMPLIANT"
+            elif r["passed"] is False:
+                status = "NON-COMPLIANT"
+            elif r.get("severity") == "INFO":
+                status = "INFO"
+            else:
+                status = "REVIEW"
+            sev = r.get("severity", "")
+            lines.append(f"    {status:<14} [{sev}] {r['message']}")
+
+    lines.append(f"\n{'=' * 50}")
+    lines.append(f"Summary: {passed} compliant, {failed} non-compliant, {manual} review, {info} info — {total} total")
+
+    if failed > 0:
+        must_failures = sum(
+            1 for r in results
+            if r["passed"] is False and r.get("severity") == "MUST"
+        )
+        if must_failures:
+            lines.append(f"BLOCKED — {must_failures} MUST gate(s) non-compliant. Fix before advancing.")
+        else:
+            lines.append("WARNINGS — non-compliant items are SHOULD severity (advisory, not blocking)")
+    elif manual > 0:
+        lines.append("REVIEW — manual checks require human verification")
+    else:
+        lines.append("ALL GATES COMPLIANT — ready to advance")
+
+    return "\n".join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Check SDLC phase exit gates")
+    parser.add_argument("--state", required=True, help="Path to .sdlc/state.yaml")
+    parser.add_argument("--phase", type=str, default=None, help="Phase to check (default: current; e.g. 0, 3, build, 9, close)")
+    args = parser.parse_args()
+
+    state_path = Path(args.state)
+    if not state_path.exists():
+        print(f"Error: State file not found: {state_path}")
+        sys.exit(1)
+
+    state = load_yaml(state_path)
+    sdlc_dir = state_path.parent
+    profile_path = sdlc_dir / "profile.yaml"
+
+    if not profile_path.exists():
+        print(f"Error: Profile not found: {profile_path}")
+        sys.exit(1)
+
+    profile = load_yaml(profile_path)
+    phase_id = pm.normalize_id(args.phase if args.phase is not None else state["current_phase"])
+    artifacts_base = sdlc_dir / "artifacts"
+
+    results = check_phase_gates(phase_id, state, profile, artifacts_base)
+    output = format_results(results, phase_id)
+    print(output)
+
+    # Log metrics for empirical tracking (Issue #6)
+    log_gate_metrics(results, phase_id, sdlc_dir)
+
+    # Exit with error if any MUST gates failed
+    must_failures = [r for r in results if r["passed"] is False and r.get("severity") == "MUST"]
+    sys.exit(1 if must_failures else 0)
+
+
+if __name__ == "__main__":
+    main()

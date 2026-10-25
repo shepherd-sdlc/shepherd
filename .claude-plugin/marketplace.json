@@ -1,0 +1,24 @@
+{
+  "name": "mckruz",
+  "description": "Shepherd Free — SDLC orchestration plus the one-command delivery harness for Claude Code.",
+  "owner": {
+    "name": "MCKRUZ",
+    "url": "https://github.com/MCKRUZ"
+  },
+  "plugins": [
+    {
+      "name": "shepherd",
+      "source": ".",
+      "version": "2.1.0",
+      "description": "Shepherd: SDLC orchestration plus a one-command install of the delivery harness (governance CLAUDE.md, CI rail gates and eval workflows, Stop and review hooks, build-loop agents and skills, IaC starters). Works with GitHub.",
+      "category": "sdlc",
+      "keywords": [
+        "sdlc",
+        "harness",
+        "gates",
+        "quality",
+        "github"
+      ]
+    }
+  ]
+}

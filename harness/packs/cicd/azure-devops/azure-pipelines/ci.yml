@@ -1,0 +1,316 @@
+# CI rail (the-rails.md §3): build + test + lint + coverage, plus the spec-gate — the mechanical,
+# deterministic gate. HARD BLOCK. Nothing here calls an LLM; it answers only what a machine can answer
+# definitively (does it compile, do the tests pass, is coverage met, does a source PR carry its spec).
+# Consumes the stack pack's ci-profile.yaml via the templates below (setup-toolchain +
+# restore-build-test) — no stack commands are hard-coded as policy in this file. The templates carry
+# `<<CI_*>>` tokens the installer fills at compose time from the selected stack pack's ci-profile
+# joined with this pack's toolchain_map (pack.yaml); the install FAILS CLOSED on an unfilled token.
+#
+# HOW IT BLOCKS ON AZURE: for Azure Repos, `pr:` YAML triggers are ignored — PR runs are driven by a
+# **build validation branch policy**. scripts/configure-branch-policies.sh registers this pipeline
+# ("build-and-test") as a REQUIRED (blocking) build validation on the protected branch; a red run there
+# is what stops the merge. It also runs on push to the protected branch (the `trigger:` below) to feed
+# deploy-dev.
+#
+# ── PLACEHOLDERS (adapt per repo, then delete this block) ──────────────────────
+#   <<DEFAULT_BRANCH>>          protected branch (reference: main).
+#   <<VARIABLE_GROUP>>          variable group (ideally Key-Vault-backed) — only needed if you keep the
+#                               eval-gate stage or wire secrets; the mechanical stage needs none.
+#   <<SPEC_GATE_SRC_RE>>        regex for what counts as source in the spec-gate stage (default: ^src/).
+#                               A PR matching it must carry a committed spec in its diff.
+#   <<SERVICE_PROVISIONING>>    a `services`/sidecar container + schema/seed if integration tests need a
+#                               DB/cache/broker. Azure Pipelines runs service containers differently from
+#                               GitHub; the reference shows a Postgres sidecar. DELETE if not needed.
+#   <<EVAL_TEST_PROJECT>>       the test project holding the eval fixtures, for the optional agentic
+#                               eval-fixture hard gate. Keep only if you ship agent behavior that must
+#                               not regress; else delete the eval-gate stage. NOT written in this file:
+#                               it rides inside the substituted «ci-profile.eval_gate.command» and only
+#                               appears if that stack's runner needs a project path (.NET does; a pytest
+#                               marker does not).
+#
+# NOT placeholders any more — these are STACK SEAMS the installer fills from ci-profile.yaml:
+#   the toolchain + its version, the restore/build/test/lint commands (which carry the repo's own
+#   {{SOLUTION_OR_PROJECT}} blank inside them), and the coverage floor.
+# ───────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main                    # <<DEFAULT_BRANCH>> — push builds feed deploy-dev; PR builds come from the branch policy
+pr: none                        # Azure Repos PR runs are driven by the build-validation policy, not by `pr:`
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+  # ── spec-gate ─────────────────────────────────────────────────────────────────────
+  # "No spec, no build" (the-rails.md §2), enforced deterministically. The grader only WARNS when a PR
+  # carries no committed spec (grader.yml); this stage BLOCKS: a source change with no spec in the diff
+  # is a fact, and facts block. A red stage fails the whole build-validation run, which is what blocks
+  # the merge on Azure Repos. The recorded escape is the `no-spec:chore` PR label + the reason in the
+  # PR description.
+  # PR-context only: this pipeline also runs on push to the protected branch (the `trigger:` above) to
+  # feed deploy-dev — those runs have no PR to judge or read labels from, so the stage skips cleanly
+  # (Build.Reason is only 'PullRequest' on build-validation runs; a skipped stage does not fail the run).
+  - stage: spec_gate
+    displayName: 'spec-gate'
+    dependsOn: []                   # parallel to build_and_test — no reason to serialize the two gates
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    jobs:
+      - job: spec_gate
+        displayName: 'spec-gate'
+        steps:
+          - template: templates/checkout-with-base.yml   # full history + fetches the PR target branch, sets $(baseRef)
+
+          - bash: |
+              set -euo pipefail
+              # Recorded escape: the `no-spec:chore` PR label (for chores that genuinely need no spec).
+              # Azure DevOps puts no labels in the pipeline context, so read them from the REST API with
+              # the pipeline's own $(System.AccessToken) — the same pattern as scripts/post-pr-thread.sh.
+              # Endpoint verified against Microsoft Learn ("Pull Request Labels - List", api-version 7.1):
+              #   GET {org}/{project}/_apis/git/repositories/{repositoryId}/pullRequests/{pullRequestId}/labels
+              #   → WebApiTagDefinition[] — objects with {id, name, active, url}, wrapped as {count, value}.
+              if [ -z "${SYSTEM_ACCESSTOKEN:-}" ]; then
+                echo "##vso[task.logissue type=warning]System.AccessToken not mapped — cannot check the no-spec:chore exemption label; the gate proceeds without the escape."
+              else
+                LABELS_URL="${ORG_URL%/}/${PROJECT}/_apis/git/repositories/${REPO_ID}/pullRequests/${PR_ID}/labels?api-version=7.1"
+                LABELS_JSON="$(curl -sf -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" "$LABELS_URL" || echo '{}')"
+                if printf '%s' "$LABELS_JSON" | jq -e '(.value // .)[]? | select(.name == "no-spec:chore")' >/dev/null; then
+                  echo "NOTICE: 'no-spec:chore' label present — spec-gate exemption recorded for this PR. State the reason in the PR description."
+                  exit 0
+                fi
+              fi
+              changed="$(git diff --name-only "origin/${BASE_REF}...HEAD")"
+              source_touched="$(printf '%s\n' "$changed" | grep -E "$SRC_RE" || true)"
+              # New-or-modified spec files in this PR's diff (not deleted).
+              # KEEP IN SYNC: this is the SAME regex grader.yml uses to identify the
+              # committed spec file — change one, change both.
+              spec_in_diff="$(git diff --name-only --diff-filter=d "origin/${BASE_REF}...HEAD" -- "${SPEC_DIR}/" \
+                | grep -E "^${SPEC_DIR}/[0-9]+.*\.md$" || true)"
+              if [ -n "$source_touched" ] && [ -z "$spec_in_diff" ]; then
+                echo "##vso[task.logissue type=error]No spec, no build — this PR touches source but carries no committed spec."
+                echo "Source files touched (match SRC_RE '${SRC_RE}'):"
+                printf '%s\n' "$source_touched" | sed 's/^/  - /'
+                echo "No ${SPEC_DIR}/NNNN-*.md file is in this PR's diff."
+                echo "To comply: add or update the spec for this change under ${SPEC_DIR}/ so it rides in this PR."
+                echo "Recorded escape: apply the 'no-spec:chore' label and state the reason in the PR description."
+                exit 1
+              fi
+              if [ -z "$source_touched" ]; then
+                echo "OK: not a source PR (nothing matches SRC_RE '${SRC_RE}') — spec-gate does not apply."
+              else
+                echo "OK: spec present in the diff: $(printf '%s\n' "$spec_in_diff" | head -n1)"
+              fi
+            displayName: 'Require a spec in the diff for source changes'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)      # allow the OAuth token in the pipeline settings
+              ORG_URL: $(System.CollectionUri)
+              PROJECT: $(System.TeamProject)
+              REPO_ID: $(Build.Repository.ID)
+              PR_ID: $(System.PullRequest.PullRequestId)
+              BASE_REF: $(baseRef)                            # set by checkout-with-base.yml
+              SRC_RE: '^src/'                                 # <<SPEC_GATE_SRC_RE>> — what counts as source
+              SPEC_DIR: 'specs'                               # <<SPEC_DIR>> — same directory grader.yml reads
+
+  - stage: build_and_test
+    displayName: 'build-and-test'   # <-- register this pipeline as a REQUIRED build validation policy
+    dependsOn: []                   # explicit: run in parallel with spec_gate, not after it
+    jobs:
+      - job: build_and_test
+        displayName: 'build-and-test'
+        # <<SERVICE_PROVISIONING>> — Azure Pipelines can run sidecar service containers on a container job.
+        # The reference shows Postgres. DELETE this `services:`/schema step pairing if not needed.
+        # services:
+        #   database: postgres16
+        # container: {}   # a container job is required to attach `services`; see RAILS.md.
+        variables:
+          # Setting this both points tests at the service AND (by convention) makes the fixture fail hard
+          # on a bad connection rather than skip. <<SERVICE_PROVISIONING>>
+          TEST_DB_CONN: 'Host=localhost;Port=5432;Database=appdb;Username=appdb;Password=appdb'
+        steps:
+          # Secret scan (hard gate) — a committed credential is a fact; facts block.
+          # Runs first: it needs no toolchain and a hit invalidates everything after it.
+          # The binary is version- AND checksum-pinned (the standard's supply-chain rule:
+          # no @latest, no unverified downloads). Scans the checked-out tree; history
+          # scanning is a one-time onboarding task, not a per-PR gate.
+          - bash: |
+              set -euo pipefail
+              curl -fsSL -o gitleaks.tar.gz \
+                https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+              echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+              tar -xzf gitleaks.tar.gz gitleaks
+              ./gitleaks dir . --no-banner --redact
+              rm -f gitleaks gitleaks.tar.gz
+            displayName: 'Secret scan (gitleaks)'
+
+          - template: templates/setup-toolchain.yml         # ci-profile.toolchain via toolchain_map
+
+          # <<SERVICE_PROVISIONING>> — apply schema/seed once the service is healthy. Service containers do
+          # not run an image's init scripts. DELETE if no external service.
+          # - bash: |
+          #     set -euo pipefail
+          #     for f in db/init/*.sql; do
+          #       PGPASSWORD=appdb psql -h localhost -p 5432 -U appdb -d appdb -v ON_ERROR_STOP=1 -f "$f"
+          #     done
+          #   displayName: 'Apply database schema'
+
+          # ci-profile.commands + coverage.floor_percent. Both defaults come from the stack pack via
+          # the template's own seam tokens, so this site passes no parameters.
+          - template: templates/restore-build-test.yml
+
+  # ── OPTIONAL: eval-gate ─────────────────────────────────────────────────────────
+  # A second HARD gate for repos that ship agentic behavior with an eval-fixture suite that must not
+  # regress (the source repo's "OWASP Agentic Top-10 Gate"). Realized from ci-profile.eval_gate. Any
+  # failing fixture exits non-zero and BLOCKS the merge. A legitimate, time-boxed bypass is RECORDED in a
+  # ledger (the gate still runs; the ledger documents why a known failure was accepted).
+  # DELETE this whole stage if you have no such suite. If you keep it, register it as a REQUIRED build
+  # validation policy too (branch-policies.json).
+  - stage: eval_gate
+    displayName: 'eval-gate'
+    dependsOn: build_and_test
+    condition: succeeded()
+    jobs:
+      - job: eval_gate
+        displayName: 'eval-gate'
+        steps:
+          - template: templates/setup-toolchain.yml
+          - script: |
+              <<CI_RESTORE_CMD>>
+            displayName: 'Restore'
+            # «stack pack: ci-profile.commands.restore»
+          - script: |
+              <<CI_BUILD_CMD>>
+            displayName: 'Build'
+            # «stack pack: ci-profile.commands.build»
+          # «stack pack: ci-profile.eval_gate.command» — the WHOLE runner invocation, including the
+          # filter, because a filter's syntax is runner-specific and means nothing without the flag
+          # that consumes it. The stack contracts to write its results into `eval-results/` (a
+          # relative dir, like `coverage/`) — that is why the publish step below reads a plain path
+          # and not $(Agent.TempDirectory): an ADO-ism in a stack-declared command would leak this
+          # platform's vocabulary into the stack layer, which is the coupling the seam exists to break.
+          - script: |
+              <<CI_EVAL_CMD>>
+            displayName: 'Run eval fixtures (hard gate)'
+          - task: PublishPipelineArtifact@1
+            displayName: 'Upload eval results'
+            condition: always()
+            inputs:
+              targetPath: 'eval-results'
+              artifact: 'eval-gate-results'
+
+  # ── dependency-gate ──────────────────────────────────────────
+  # The standard's position on third-party components (GOLD-STANDARD §7).
+  #
+  # Blocks a PR that INTRODUCES a package with a known vulnerability. Does NOT block on what was
+  # already there — the weekly dependency-scan pipeline owns the standing stock and raises a work
+  # item, which rides the normal rails as an ordinary spec.
+  #
+  # That split is the whole design. Every other gate here measures the diff; a vulnerability scan
+  # measures the repo. Blocking on the repo means a CVE published overnight reddens every open PR
+  # the next morning for reasons nobody caused — the failure deploy-dev.yml argues against at
+  # length: a job red by design teaches the team that red is normal, degrading every OTHER job's
+  # signal. Diff-scoping is what keeps this gate meaning something when it fires.
+  #
+  # HOW: run the stack's scan against the TARGET branch and against THIS branch, then compare the
+  # two sets of findings. A set difference, not lockfile parsing — which is why one mechanism
+  # serves .NET, Node and Python without this pipeline knowing anything about any of them. The
+  # normalizing belongs to the stack pack (ci-profile.dependency_scan), same seam as commands.*.
+  - stage: dependency_gate
+    displayName: 'dependency-gate'
+    dependsOn: []                 # independent of the other stages; nothing here needs a build
+    condition: eq(variables['Build.Reason'], 'PullRequest')
+    jobs:
+      - job: dependency_gate
+        displayName: 'dependency-gate'
+        steps:
+          - checkout: self
+            fetchDepth: 0         # the target branch is scanned too, so shallow will not do
+
+          - template: templates/setup-toolchain.yml
+
+          # ── Scan THIS branch ────────────────────────────────────────────────
+          # The scan command is contracted (ci-profile.dependency_scan) to print one TSV finding
+          # per line and EXIT 0 whether or not it finds anything. A non-zero exit therefore means
+          # the TOOLING broke, not that the code is vulnerable — and those need different
+          # messages, because they have different fixes.
+          - bash: |
+              set -uo pipefail
+              # «stack pack: ci-profile.dependency_scan.command»
+              if ! <<CI_DEPENDENCY_SCAN_CMD>> > "$(Agent.TempDirectory)/head.tsv" 2> "$(Agent.TempDirectory)/head.err"; then
+                echo "##vso[task.logissue type=error]The scan of THIS branch did not complete, so this gate cannot tell whether the change introduces a vulnerable package. Failing closed rather than passing unverified."
+                sed -n '1,40p' "$(Agent.TempDirectory)/head.err" || true
+                exit 1
+              fi
+              sort -u -o "$(Agent.TempDirectory)/head.tsv" "$(Agent.TempDirectory)/head.tsv"
+              echo "Findings on this branch: $(wc -l < "$(Agent.TempDirectory)/head.tsv")"
+            displayName: 'Scan this branch'
+
+          # ── Scan the TARGET branch, to establish what is NOT this change's doing ──────────
+          - bash: |
+              set -uo pipefail
+              TARGET="$(System.PullRequest.TargetBranch)"       # e.g. refs/heads/main
+              SHORT="${TARGET#refs/heads/}"
+              git fetch --no-tags --quiet origin "$SHORT"
+              # A destructive checkout is fine: this job exists only for the comparison, and
+              # nothing after it reads the working tree.
+              git checkout --quiet --detach "origin/$SHORT"
+              # «stack pack: ci-profile.dependency_scan.command»
+              if ! <<CI_DEPENDENCY_SCAN_CMD>> > "$(Agent.TempDirectory)/base.tsv" 2> "$(Agent.TempDirectory)/base.err"; then
+                # Do NOT treat a broken baseline as "the target was clean". That would make every
+                # pre-existing finding look newly introduced and bury the real one in a false storm.
+                echo "##vso[task.logissue type=error]The scan of '$SHORT' did not complete, so this gate has no baseline. It cannot separate what this change introduced from what was already there."
+                sed -n '1,40p' "$(Agent.TempDirectory)/base.err" || true
+                exit 1
+              fi
+              sort -u -o "$(Agent.TempDirectory)/base.tsv" "$(Agent.TempDirectory)/base.tsv"
+              echo "Findings already on $SHORT: $(wc -l < "$(Agent.TempDirectory)/base.tsv")"
+            displayName: 'Scan the target branch'
+
+          - bash: |
+              set -euo pipefail
+              # In head, not in base. comm requires both inputs sorted; both were sorted above.
+              comm -13 "$(Agent.TempDirectory)/base.tsv" "$(Agent.TempDirectory)/head.tsv" > "$(Agent.TempDirectory)/new.tsv"
+
+              if [ ! -s "$(Agent.TempDirectory)/new.tsv" ]; then
+                echo "OK: this change introduces no new vulnerable package."
+                exit 0
+              fi
+
+              echo "New relative to the target branch:"
+              cat "$(Agent.TempDirectory)/new.tsv"
+
+              # CASE-INSENSITIVE on purpose: .NET renders 'High', npm renders 'high'. A
+              # case-sensitive match would silently match nothing on one of them — and a gate
+              # that matches nothing passes forever. Verified against both tools, 2026-07-31.
+              awk -F'\t' -v list="$BLOCK_SEVERITIES" '
+                BEGIN { n = split(tolower(list), a, /,/)
+                        for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", a[i]); block[a[i]] = 1 } }
+                tolower($1) in block { print }
+              ' "$(Agent.TempDirectory)/new.tsv" > "$(Agent.TempDirectory)/blocking.tsv"
+
+              if [ ! -s "$(Agent.TempDirectory)/blocking.tsv" ]; then
+                echo "##vso[task.logissue type=warning]This change introduces packages with known advisories below $BLOCK_SEVERITIES. Reported, not blocked."
+                exit 0
+              fi
+
+              echo "Blocking ($BLOCK_SEVERITIES):"
+              cat "$(Agent.TempDirectory)/blocking.tsv"
+
+              # Azure DevOps puts no labels in the pipeline context, so read them from the REST API,
+              # the same way the spec-gate stage reads no-spec:chore. The label is an AUDITED manual
+              # override, not an authorization check — the branch policy's required non-author
+              # approval still gates completion after this passes.
+              LABELS_URL="${SYSTEM_COLLECTIONURI%/}/${SYSTEM_TEAMPROJECT}/_apis/git/repositories/${BUILD_REPOSITORY_ID}/pullRequests/${SYSTEM_PULLREQUEST_PULLREQUESTID}/labels?api-version=7.1"
+              LABELS_JSON="$(curl -sf -H "Authorization: Bearer ${SYSTEM_ACCESSTOKEN}" "$LABELS_URL" || echo '{}')"
+              if printf '%s' "$LABELS_JSON" | jq -e '(.value // .)[]? | select(.name == "accepted-risk:dependency")' >/dev/null; then
+                echo "##vso[task.logissue type=warning]This change introduces a vulnerable package, but the 'accepted-risk:dependency' label records an accepted-risk override (audited in the PR timeline). Record the reason and an expiry in .azuredevops/rails/dependency-exceptions.md. The branch policy's required non-author approval still gates completion."
+                exit 0
+              fi
+
+              echo "##vso[task.logissue type=error]This change introduces a package with a known $BLOCK_SEVERITIES vulnerability. Upgrade it, drop it, or apply the 'accepted-risk:dependency' label AND record the reason and expiry in .azuredevops/rails/dependency-exceptions.md (audited; completion still needs the branch policy's non-author approval)."
+              exit 1
+            displayName: 'Block on what this change introduced'
+            env:
+              SYSTEM_ACCESSTOKEN: $(System.AccessToken)
+              # «stack pack: ci-profile.dependency_scan.block_severities»
+              BLOCK_SEVERITIES: '<<CI_DEPENDENCY_BLOCK_SEVERITIES>>'

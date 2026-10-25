@@ -1,0 +1,168 @@
+# Node / TypeScript CI command profile — the interface a CI/CD pack consumes.
+#
+# A CI/CD pack (packs/cicd/github, packs/cicd/azure-devops) reads these values and realizes them into
+# its platform's pipeline syntax. This is MECHANICAL, not a copy-by-hand: the installer builds a
+# `<<CI_*>>` token table from this file plus the CI/CD pack's `toolchain_map:` and substitutes it into
+# every file that pack overlays. An unfilled token fails the install closed. The exact token each key
+# fills is noted below; the full contract is packs/README.md "The seam between the two".
+#
+# This file is a COMPOSE-TIME INPUT — it is never installed into the target repo. What lands there is
+# the realized pipeline carrying these values.
+#
+# NO {{REPO_TOKEN}} HERE, deliberately. The .NET profile carries {{SOLUTION_OR_PROJECT}} because
+# `dotnet` needs to be told WHAT to build. A Node repo's equivalent is nothing: `npm ci` reads
+# package-lock.json and `tsc --project tsconfig.json` reads the conventional root config, both by
+# convention from the repo root. A token here would be symmetry for its own sake — see packs/README.md.
+#
+# Shape mirrors packs/stacks/dotnet/ci-profile.yaml (the reference). The commands are this stack's own;
+# each was verified against current upstream docs (see README.md "Provenance"), not carried over.
+
+toolchain:
+  # Which toolchain — NOT how to install it. Each CI/CD pack maps this id to its own platform's setup
+  # step via `toolchain_map:` in its pack.yaml (github → actions/setup-node@v7 + `node-version`;
+  # azure-devops → UseNode@1 + `version`). An id no CI/CD pack maps fails the install closed.
+  # `node` is mapped by BOTH packs today — verified against their toolchain_map blocks.
+  id: node               # -> <<CI_TOOLCHAIN_ACTION>> / <<CI_TOOLCHAIN_INPUT>> (via toolchain_map)
+  # 24.x is the ACTIVE LTS as of 2026-07-16 (nodejs/Release: 24.x "Krypton", Active LTS 2025-10-28 →
+  # maintenance 2026-10-20). 22.x is already MAINTENANCE LTS; 26.x is Current, not LTS. The standard
+  # runs Active LTS. Revisit when 26.x enters Active LTS (2026-10-28).
+  version: "24.x"        # -> <<CI_TOOLCHAIN_VERSION>>
+
+# Each command MUST be a single line: the CI/CD pack splices it verbatim into one `run:`/`script:`
+# block scalar, so an embedded newline would emit an extra, unreviewed shell line. The installer
+# rejects a multi-line command. A folded '>-' scalar (see `test`) is single-line once loaded — the
+# line breaks are authoring convenience and fold back to spaces.
+#
+# TOOLING DECISIONS (justified, not defaulted):
+#  - npm, not pnpm/yarn: the delivery standard's toolchain rule is npm/npx. `npm ci` is also the
+#    correct CI verb — it installs from package-lock.json exactly and fails if the lockfile is out of
+#    sync with package.json, which is the restore-step behavior a gate wants (`npm install` would
+#    silently rewrite the lockfile mid-pipeline).
+#  - vitest, not jest: vitest runs TypeScript and native ESM without a separate transform pipeline
+#    (babel/ts-jest), which is the whole cost centre of jest on a modern TS/ESM repo.
+#  - `npx <tool>` runs the version pinned in the repo's devDependencies (installed by `npm ci`) — it
+#    is not an arbitrary registry download. vitest + @vitest/coverage-v8 + typescript + eslint must be
+#    devDependencies, or these commands fail closed at restore. See README.md.
+commands:
+  restore: npm ci                                    # -> <<CI_RESTORE_CMD>>
+  build:   npx tsc --project tsconfig.json           # -> <<CI_BUILD_CMD>>
+  # -> <<CI_TEST_CMD>>. `vitest run` = single pass, no watch. Coverage flags use dot notation, which
+  # per Vitest docs REQUIRES `--coverage.enabled` (never a bare `--coverage` alongside it).
+  #
+  # Vitest reports through istanbul-reports, whose cobertura reporter writes `cobertura-coverage.xml`
+  # (its `{ file }` option is config-file-only, not CLI-expressible). That name is fine as-is: the
+  # CI/CD packs' coverage-floor gate accepts any cobertura report under coverage/, because report
+  # names differ per stack and none of them is wrong. The stack declares; the platform adapts.
+  test:    >-
+    npx vitest run
+    --coverage.enabled --coverage.provider=v8
+    --coverage.reporter=cobertura --coverage.reporter=text
+    --coverage.reportsDirectory=coverage
+  lint:    npx eslint .                              # -> <<CI_LINT_CMD>>
+
+coverage:
+  # The standard's floor. ENFORCED BY THE PIPELINE: each CI/CD pack has an explicit post-test gate
+  # step that parses the cobertura reports from `coverage/` and exits non-zero below this number
+  # (github ci.yml "Enforce coverage floor"; the ADO restore-build-test template's twin).
+  #
+  # Vitest CAN self-enforce (`--coverage.thresholds.lines=<n>`), and repos SHOULD wire that into their
+  # local `npm test` script for fast feedback. It is deliberately NOT in the test command above: that
+  # would hard-code a second 80 with nothing keeping it in sync with this key, and the pipeline gate is
+  # the authoritative one. One floor, one place.
+  floor_percent: 80        # -> <<CI_COVERAGE_FLOOR>>
+  tool: "@vitest/coverage-v8"   # informational: what produces the cobertura report the gate reads
+
+# Optional second hard gate — kept only when the repo ships agentic behavior that must not regress.
+# Realized by the CI/CD pack as an extra job/stage.
+#
+# The selection is a TEST-NAME regex, because that is what vitest filters on (`-t`); there is no
+# xUnit-style trait system. Convention: tag the fixture titles, e.g.
+# `describe('@owasp-agentic tool poisoning', ...)`. (`@` is not regex-special; no escaping needed.)
+#
+# CONTRACT with the CI/CD packs: results land in `eval-results/` (relative), which their upload step
+# publishes. Vitest creates that directory recursively — verified on 3.2.7 and 4.1.10, but it is
+# UNDOCUMENTED behavior; the guard below fails closed if the file is missing, so a regression here
+# breaks loudly rather than silently.
+#
+# ── WHY THE GUARD EXISTS. READ BEFORE SIMPLIFYING. ────────────────────────────────────────────────
+# `vitest run -t "<pattern>"` matching ZERO tests exits 0. Verified on 3.2.7 and 4.1.10. Rename the
+# tag, typo it, or delete the last fixture, and the bare command PASSES GREEN having run nothing —
+# a gate that blocks merges would be theater. This is not hypothetical: the earlier version of this
+# very file told Node repos to adapt the job to `npx vitest run <dir> -t "<filter>"`, i.e. it
+# documented the fake gate as the supported path.
+#
+# What does NOT work, each verified, so nobody re-discovers them the hard way:
+#   --passWithNoTests=false  — a different condition entirely (no test FILES found). Zero name
+#                              matches means the files were found and the tests SKIPPED. Still 0.
+#   json `success`           — `true` on a zero-match run.
+#   json `numTotalTests`     — counts COLLECTED, not matched: reports 2 when 0 ran.
+#   --reporter=junit         — its `tests="2"` counts skipped too; fake-passes identically.
+# Only numPassedTests + numFailedTests distinguishes "ran and passed" from "never ran".
+#
+# vitest exit-0-on-zero-match is undocumented (the docs are silent, it is arguably a bug). If a
+# future version fixes it, this guard becomes redundant but stays correct.
+eval_gate:
+  enabled: false
+  # -> <<CI_EVAL_CMD>>. No <<EVAL_TEST_PROJECT>> blank: `-t` selects across the whole suite, so
+  # unlike .NET this stack needs no project path — the blank never appears in a Node repo.
+  # Message is platform-neutral (no ::error:: annotation): this profile feeds BOTH cicd packs.
+  command: >-
+    npx vitest run -t "@owasp-agentic"
+    --reporter=default --reporter=json --outputFile.json=eval-results/eval-gate.json
+    && node -e "const r=require('./eval-results/eval-gate.json');
+    const n=r.numPassedTests+r.numFailedTests;
+    if(!n){console.error('eval-gate: 0 fixtures matched @owasp-agentic - failing closed');
+    process.exit(1)} console.log('eval-gate: '+n+' fixture(s) ran')"
+
+# Feeds profile.quality.session_health_check when the CI/CD pack / hooks wire a session-start smoke test.
+# --noEmit: a health check answers "does this still type-check?" — it must not write build output.
+# ── DEPENDENCY SCAN — the third-party-component position (GOLD-STANDARD §7) ───────────────────────
+# Contract and rationale: see packs/stacks/dotnet/ci-profile.yaml, the reference profile. In short —
+# print ONE FINDING PER LINE as TSV `<severity>\t<package>\t<version-or-range>\t<advisory-url>`,
+# print nothing else, and EXIT 0 whether or not findings exist. The CI/CD pack runs this against the
+# base tree and the head tree and blocks only on what the change INTRODUCED.
+#
+# ── VERIFIED EMPIRICALLY, 2026-07-31, npm 11.5.2 / node 22.17.1 ──────────────────────────────────
+# Probe: lodash@4.17.15 + minimist@1.2.0 (real published High and Critical advisories).
+#
+#   *** `npm audit --json` EXITS 1 WHEN IT FINDS ANYTHING. ***
+#
+# The exact opposite of the .NET tool, which exits 0 even on a High finding. Two traps pointing in
+# two directions: .NET's silently PASSES a gate that trusts its status, npm's silently ABORTS the
+# step under `set -euo pipefail` before jq ever runs — which, in a naive pipeline, also reads as
+# "no findings". Hence `|| true` in a subshell below. It is not sloppiness; removing it breaks the
+# gate in the passing direction.
+#
+# Verified shape: `.vulnerabilities` is an OBJECT KEYED BY PACKAGE NAME (not an array), each entry
+# carrying {name, severity, range, via[]}. `via[]` holds a MIX of objects (the advisories) and bare
+# strings (cross-references to other package names) — hence `select(type=="object")`; without it jq
+# errors on the strings and the step dies.
+#
+# npm reports the affected RANGE (`<=4.17.23`), not a single resolved version, so field 3 is a range
+# here where .NET puts an exact version. Both are stable identities for set-comparison, which is all
+# the gate needs.
+#
+# npm severities are LOWERCASE (`high`, `critical`); .NET's are capitalized (`High`, `Critical`).
+# That is why the pack compares `block_severities` case-insensitively — verified necessity, not
+# defensive habit.
+dependency_scan:
+  enabled: true
+  # -> <<CI_DEPENDENCY_SCAN_CMD>>
+  # Same repair as the python profile's, for the same reason. `npm audit` exits non-zero when
+  # it FINDS something, so the `|| true` is necessary — but on its own it also hid a missing
+  # lockfile or a wrong working directory, leaving "no advisories" and "never looked"
+  # indistinguishable. npm reports how many dependencies it examined, so the scan now says so
+  # and fails when the answer is none.
+  # The outer ( ) is load-bearing — see the note in packs/stacks/python/ci-profile.yaml. This
+  # command is spliced textually into `if ! <command> > findings.tsv; then`, and a bare
+  # multi-statement list there inverts the gate.
+  command: >-
+    ( D="${RUNNER_TEMP:-/tmp}/dep-scan-node.json"; { npm audit --json > "$D" || true; };
+    { jq -e '(.metadata.dependencies.total // 0) > 0' "$D" >/dev/null 2>&1 || { echo "npm audit examined no dependencies, so a clean result here would mean the scan did not run rather than that the project is clean. Check that package-lock.json is present in the working directory." >&2; false; }; }
+    && jq -r '.vulnerabilities[]? | . as $v | ($v.via[]? | select(type=="object") | [$v.severity, $v.name, $v.range, .url] | @tsv)' "$D" | sort -u )
+  # -> <<CI_DEPENDENCY_BLOCK_SEVERITIES>>. npm's scale is info/low/moderate/high/critical.
+  block_severities: "high,critical"
+
+session_health:
+  command: npx tsc --project tsconfig.json --noEmit
+  timeout_seconds: 120

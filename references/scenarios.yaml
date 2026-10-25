@@ -1,0 +1,125 @@
+# Test Scenarios — SDLC Plugin Validation
+# Follows Microsoft Skills pattern: define acceptance criteria and test cases
+# that validate the plugin works correctly end-to-end.
+
+version: "1.0"
+
+scenarios:
+  - id: setup-wizard-fresh
+    name: "Setup wizard on fresh project"
+    description: "Run /sprd-setup on an empty directory with the starter profile"
+    steps:
+      - action: "Create empty directory"
+      - action: "Run /sprd-setup"
+      - action: "Select the starter profile"
+      - action: "Accept default project name"
+    acceptance_criteria:
+      - ".sdlc/ directory created"
+      - ".sdlc/state.yaml contains current_phase: \"0\""
+      - ".sdlc/profile.yaml matches the starter profile"
+      - ".sdlc/artifacts/ contains 9 phase directories (00-discovery, 01-requirements, 02-design, 03-foundation, build, 07-documentation, 08-deployment, 09-monitoring, close)"
+      - ".sdlc/constitution.md created from template"
+      - "CLAUDE.md updated with SDLC section"
+
+  - id: setup-wizard-existing
+    name: "Setup wizard on project with existing .sdlc"
+    description: "Run /sprd-setup when .sdlc/ already exists"
+    steps:
+      - action: "Run /sprd-setup on initialized project"
+    acceptance_criteria:
+      - "Warning displayed about existing .sdlc/"
+      - "User prompted for action (view status or re-initialize)"
+      - "No data loss without explicit confirmation"
+
+  - id: phase-guidance
+    name: "Phase guidance display"
+    description: "Run /sprd to see current phase guidance"
+    steps:
+      - action: "Initialize project"
+      - action: "Run /sprd"
+    acceptance_criteria:
+      - "Shows Phase 0: Discovery"
+      - "Lists required artifacts with status"
+      - "Shows primary skills to use"
+      - "Shows exit criteria"
+      - "Includes quick command reference"
+
+  - id: gate-check-fail
+    name: "Gate check with missing artifacts"
+    description: "Run /sprd-gate when required artifacts are missing"
+    steps:
+      - action: "Initialize project"
+      - action: "Run /sprd-gate (no artifacts created)"
+    acceptance_criteria:
+      - "Reports FAIL for G1-integrity (missing problem-statement.md)"
+      - "Reports FAIL for G2-completeness"
+      - "Shows BLOCKED status"
+      - "Suggests creating missing artifacts"
+
+  - id: gate-check-pass
+    name: "Gate check with complete artifacts"
+    description: "Run /sprd-gate after creating all required artifacts"
+    steps:
+      - action: "Initialize project"
+      - action: "Create problem-statement.md with complete content"
+      - action: "Run /sprd-gate"
+    acceptance_criteria:
+      - "Reports PASS for all gates"
+      - "Shows ALL GATES PASSED"
+      - "Suggests running /sprd-next"
+
+  - id: phase-advance
+    name: "Phase advance from 0 to 1"
+    description: "Run /sprd-next to advance from Discovery to Requirements"
+    steps:
+      - action: "Initialize project"
+      - action: "Create problem-statement.md"
+      - action: "Run /sprd-next"
+    acceptance_criteria:
+      - "Gate checks run and pass"
+      - "state.yaml current_phase updated to 1"
+      - "Phase 0 marked completed with timestamp"
+      - "Phase 1 marked active with timestamp"
+      - "History entry appended"
+      - "Next phase guidance displayed"
+
+  - id: status-dashboard
+    name: "Status dashboard display"
+    description: "Run /sprd-status to view progress"
+    steps:
+      - action: "Initialize project"
+      - action: "Advance to Phase 1"
+      - action: "Run /sprd-status"
+    acceptance_criteria:
+      - "Shows project name and profile"
+      - "Shows progress bar (10%)"
+      - "Phase 0 shows [x] completed"
+      - "Phase 1 shows [>] active"
+      - "Phases 2-9 show [ ] pending"
+      - "History shows Phase 0 → Phase 1 transition"
+
+
+  - id: placeholder-detection
+    name: "Gate rejects placeholder content"
+    description: "Verify G2-completeness catches TODO/TBD/placeholder content"
+    steps:
+      - action: "Initialize project"
+      - action: "Create problem-statement.md with 'TODO: fill in details'"
+      - action: "Run /sprd-gate"
+    acceptance_criteria:
+      - "G2-completeness FAIL reported"
+      - "Message mentions placeholder content"
+      - "Lists specific placeholder found (TODO)"
+
+  - id: full-lifecycle
+    name: "Complete SDLC lifecycle (smoke test)"
+    description: "Walk through all 9 phases (0, 1, 2, 3, build, 7, 8, 9, close) with minimal artifacts"
+    steps:
+      - action: "Initialize project"
+      - action: "For each phase in lifecycle order (0, 1, 2, 3, build, 7, 8, 9, close): create required artifacts, run /sprd-next"
+    acceptance_criteria:
+      - "All 9 phases complete"
+      - "state.yaml shows current_phase: \"close\" with status completed"
+      - "History has 8 transition entries"
+      - "No errors during any transition"
+

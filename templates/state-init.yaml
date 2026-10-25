@@ -1,0 +1,93 @@
+# SDLC State Machine — Initial State
+# This file is copied to .sdlc/state.yaml during project setup.
+# It tracks the current phase, completed gates, and artifact status.
+#
+# Phase ids are STRINGS and NON-sequential: 0,1,2,3,build,7,8,9,close.
+# The 4/5/6 gap is intentional — the batch Implementation/Quality/Testing phases
+# are replaced by the continuous "build" loop. Phase identity/ordering is owned by
+# phases/phase-registry.yaml (read via scripts/phase_model.py).
+
+version: "1.0"
+profile_id: "${PROFILE_ID}"
+project_name: "${PROJECT_NAME}"
+created_at: "${CREATED_AT}"
+project_type: null  # Set during Phase 0: service | app | library | skill | cli
+
+current_phase: "0"
+phase_name: "discovery"
+
+phases:
+  "0":
+    name: discovery
+    status: active
+    entered_at: "${CREATED_AT}"
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "1":
+    name: requirements
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "2":
+    name: design
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "3":
+    name: foundation
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "build":
+    name: build
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "7":
+    name: documentation
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "8":
+    name: deployment
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "9":
+    name: monitoring
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+  "close":
+    name: close
+    status: pending
+    entered_at: null
+    completed_at: null
+    gate_results: {}
+    artifacts: []
+    artifact_checksums: {}
+
+history: []

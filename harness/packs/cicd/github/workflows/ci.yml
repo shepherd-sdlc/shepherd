@@ -1,0 +1,417 @@
+name: CI
+
+# The CI rail (the-rails.md §3): build + test + lint + coverage, plus the spec-gate —
+# the mechanical, deterministic gate. This is a HARD BLOCK: any red here stops the
+# merge. Nothing in this file calls an LLM; it answers only the questions a machine
+# can answer definitively (does it compile, do the tests pass, is coverage met, does
+# a source PR carry its spec).
+#
+# ── PACK NOTE (github CI/CD pack) ──────────────────────────────────────────────
+# This is the GitHub Actions REALIZATION of the core CI rail. Every stack-specific
+# slot is a `<<CI_*>>` COMPOSE-TIME token that the installer fills from the selected
+# stack pack's command interface, packs/stacks/<id>/ci-profile.yaml, joined with this
+# pack's `toolchain_map:` (pack.yaml). Each token is marked inline with a
+#   # «stack pack: ci-profile.<path>»
+# comment naming the value it is filled FROM — a real binding, not a note to a human.
+# Nothing .NET is hard-coded here: composing this pack with a node stack pack emits a
+# node pipeline. The installer FAILS CLOSED if any `<<CI_*>>` token survives, so an
+# installed workflow never contains a literal token.
+#
+# Commands are spliced into BLOCK scalars (`run: |`) so a substituted value carrying
+# quotes or colons can never break the YAML.
+#
+# `{{SOLUTION_OR_PROJECT}}` arrives INSIDE the substituted commands (ci-profile
+# declares it) and stays for Phase-3 repo adaptation. If NO stack pack composes, the
+# `<<CI_*>>` tokens are deliberately left unfilled and the installer warns — this file
+# then needs the same hand-adaptation as the neutral core workflow.
+#
+# ── REPO-LEVEL PLACEHOLDERS (adapt per client, then delete this block) ─────────
+# These are Phase-3 repo blanks, NOT stack seams — the installer never fills them.
+#   <<SERVICE_PROVISIONING>>  The `services:` block + any schema/seed steps your
+#                         integration tests need (DB, cache, broker). NOT a stack
+#                         seam — it is repo/integration-test specific. The reference
+#                         shows Postgres; DELETE the whole block if your tests need
+#                         no external service.
+#   <<EVAL_TEST_PROJECT>> The test project/assembly holding the eval fixtures — only
+#                         appears if your stack's «ci-profile.eval_gate.command» needs a
+#                         project path (the .NET one does; a pytest marker does not). It
+#                         is NOT written in this file: it rides inside the substituted
+#                         command and lands here unfilled, for you.
+#   <<SPEC_GATE_SRC_RE>>  Regex for what counts as source in the spec-gate job
+#                         (default: ^src/). A PR matching it must carry a spec.
+# The coverage floor is NOT a repo placeholder: it is the stack seam
+# «ci-profile.coverage.floor_percent», enforced by the "Enforce coverage floor" step.
+# ───────────────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [ main ]   # <<DEFAULT_BRANCH>>
+  pull_request:
+    branches: [ main ]   # <<DEFAULT_BRANCH>>
+
+jobs:
+  build-and-test:
+    name: build-and-test          # <-- required status-check context (branch-protection.json)
+    runs-on: ubuntu-latest
+
+    # <<SERVICE_PROVISIONING>> — provision the backing services your INTEGRATION
+    # tests actually exercise, so they execute instead of silently skipping. The
+    # credentials here must match whatever your test fixtures expect. Setting an
+    # explicit connection env var (below) should also flip your fixtures into
+    # "explicitly configured" mode, so a connectivity failure is a HARD error, not
+    # a silent skip. DELETE this whole `services:`/`env:` pairing if not needed.
+    services:
+      database:
+        image: postgres:16
+        env:
+          POSTGRES_DB: appdb
+          POSTGRES_USER: appdb
+          POSTGRES_PASSWORD: appdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U appdb -d appdb"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # Setting this both points tests at the service AND (by convention) makes the
+      # fixture fail hard on a bad connection rather than skip. <<SERVICE_PROVISIONING>>
+      TEST_DB_CONN: "Host=localhost;Port=5432;Database=appdb;Username=appdb;Password=appdb"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Secret scan (hard gate) — a committed credential is a fact; facts block.
+      # Runs first: it needs no toolchain and a hit invalidates everything after it.
+      # The binary is version- AND checksum-pinned (the standard's supply-chain rule:
+      # no @latest, no unverified downloads). Scans the checked-out tree; history
+      # scanning is a one-time onboarding task, not a per-PR gate.
+      - name: Secret scan (gitleaks)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks dir . --no-banner --redact
+          rm -f gitleaks gitleaks.tar.gz
+
+      # The github realization of the declared toolchain. ci-profile.toolchain.id is
+      # mapped through this pack's toolchain_map (pack.yaml) to the setup action and
+      # its version-input name; the version itself is ci-profile.toolchain.version.
+      - name: Setup toolchain
+        uses: <<CI_TOOLCHAIN_ACTION>>          # «stack pack: ci-profile.toolchain.id» via toolchain_map
+        with:
+          <<CI_TOOLCHAIN_INPUT>>: '<<CI_TOOLCHAIN_VERSION>>'   # «stack pack: ci-profile.toolchain.version»
+
+      # <<SERVICE_PROVISIONING>> — apply schema/seed the way your app would. GitHub
+      # Actions service containers do NOT run an image's init scripts, so apply them
+      # explicitly once the service is healthy. DELETE if no external service.
+      - name: Apply database schema
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+          for f in db/init/*.sql; do
+            echo "Applying $f"
+            PGPASSWORD=appdb psql -h localhost -p 5432 -U appdb -d appdb -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      # «stack pack: ci-profile.commands.restore»
+      - name: Restore
+        run: |
+          <<CI_RESTORE_CMD>>
+
+      # «stack pack: ci-profile.commands.build»
+      - name: Build
+        run: |
+          <<CI_BUILD_CMD>>
+
+      - name: Test with coverage
+        # «stack pack: ci-profile.commands.test» — must FAIL the job on any failing
+        # test. Coverage is COLLECTED here; the floor
+        # («ci-profile.coverage.floor_percent») is enforced by the "Enforce coverage
+        # floor" step below. (For .NET the XPlat collector cannot fail a run on a
+        # threshold — that is a coverlet.msbuild feature, not a collector feature;
+        # hence the separate gate step, which is stack-agnostic anyway.)
+        run: |
+          <<CI_TEST_CMD>>
+
+      # Coverage floor gate («stack pack: ci-profile.coverage.floor_percent»). Parses
+      # every cobertura report the collector produced and exits 1 if any line-rate is
+      # below the floor — a coverage miss is a non-zero exit, never a passing run with
+      # a low number in a report the pipeline ignores. Fails CLOSED when no report was
+      # produced. The parsing is stack-agnostic (cobertura XML); only the floor is a
+      # seam. KEEP IN SYNC with the ADO twin:
+      # packs/cicd/azure-devops/azure-pipelines/templates/restore-build-test.yml.
+      - name: Enforce coverage floor
+        env:
+          COVERAGE_FLOOR: '<<CI_COVERAGE_FLOOR>>'   # «stack pack: ci-profile.coverage.floor_percent»
+        run: |
+          set -euo pipefail
+          FLOOR="$COVERAGE_FLOOR"
+          found=0; fail=0
+          while IFS= read -r report; do
+            found=1
+            rate="$(sed -n 's/.*<coverage[^>]*line-rate="\([0-9.]*\)".*/\1/p' "$report" | head -n1)"
+            if [ -z "$rate" ]; then
+              echo "::error::Could not read line-rate from $report"
+              fail=1
+              continue
+            fi
+            pct="$(awk -v r="$rate" 'BEGIN{printf "%.2f", r*100}')"
+            if awk -v p="$pct" -v t="$FLOOR" 'BEGIN{exit !(p+0 < t+0)}'; then
+              echo "::error::Coverage ${pct}% is below the ${FLOOR}% floor ($report)"
+              fail=1
+            else
+              echo "Coverage ${pct}% >= ${FLOOR}% floor ($report)"
+            fi
+          # Any cobertura report under coverage/ counts. The names differ per stack and none
+          # is wrong: .NET's XPlat collector writes coverage.cobertura.xml, istanbul
+          # (vitest/jest) writes cobertura-coverage.xml, pytest-cov writes coverage.xml.
+          # The gate accepts all three rather than making each stack pack rename its
+          # output to suit this file — the stack declares, the platform adapts.
+          done < <(find coverage \( -name 'coverage.cobertura.xml' -o -name 'cobertura-coverage.xml' -o -name 'coverage.xml' \) 2>/dev/null)
+          if [ "$found" -eq 0 ]; then
+            echo "::error::No cobertura coverage report found under coverage/ — the coverage gate cannot pass without a report (fail closed)."
+            exit 1
+          fi
+          exit "$fail"
+
+      # OPTIONAL lint gate. The stack pack declares a lint command, but the reference
+      # rail wires no discrete lint STEP (for .NET the analyzers run inside build), and
+      # this pack preserves the reference rail's exact gate semantics.
+      # To make lint its own gate, UNCOMMENT the step below. The seam fills it whether or
+      # not it is commented out, so it already reads as YOUR stack's real command
+      # («stack pack: ci-profile.commands.lint»).
+      # - name: Lint
+      #   run: |
+      #     <<CI_LINT_CMD>>
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage
+          path: coverage/
+
+  # ── spec-gate ──────────────────────────────────────────────────────────────────
+  # "No spec, no build" (the-rails.md §2), enforced deterministically. The grader
+  # only WARNS when a PR carries no committed spec (grader.yml); this job BLOCKS:
+  # a source change with no spec in the diff is a fact, and facts block. The
+  # recorded escape is the `no-spec:chore` label + the reason in the PR description.
+  # PR-only: push builds to the protected branch have no diff-vs-base to judge.
+  # No stack seam here — the gate is pure git + jq, stack-independent.
+  spec-gate:
+    name: spec-gate               # <-- required status-check context (branch-protection.json)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # full history, so the diff against the base resolves
+
+      - name: Require a spec in the diff for source changes
+        env:
+          SRC_RE: '^src/'         # <<SPEC_GATE_SRC_RE>> — what counts as source
+          SPEC_DIR: specs         # <<SPEC_DIR>> — same directory grader.yml reads
+        run: |
+          set -euo pipefail
+          # Recorded escape: the `no-spec:chore` PR label (for chores that genuinely
+          # need no spec). Read from the event payload — no API call needed.
+          if jq -e '.pull_request.labels[]? | select(.name == "no-spec:chore")' "$GITHUB_EVENT_PATH" >/dev/null; then
+            echo "NOTICE: 'no-spec:chore' label present — spec-gate exemption recorded for this PR. State the reason in the PR description."
+            exit 0
+          fi
+          git fetch --no-tags origin "$GITHUB_BASE_REF"
+          changed="$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD")"
+          source_touched="$(printf '%s\n' "$changed" | grep -E "$SRC_RE" || true)"
+          # New-or-modified spec files in this PR's diff (not deleted).
+          # KEEP IN SYNC: this is the SAME regex grader.yml uses to identify the
+          # committed spec file — change one, change both.
+          spec_in_diff="$(git diff --name-only --diff-filter=d "origin/${GITHUB_BASE_REF}...HEAD" -- "${SPEC_DIR}/" \
+            | grep -E "^${SPEC_DIR}/[0-9]+.*\.md$" || true)"
+          if [ -n "$source_touched" ] && [ -z "$spec_in_diff" ]; then
+            echo "::error::No spec, no build — this PR touches source but carries no committed spec."
+            echo "Source files touched (match SRC_RE '${SRC_RE}'):"
+            printf '%s\n' "$source_touched" | sed 's/^/  - /'
+            echo "No ${SPEC_DIR}/NNNN-*.md file is in this PR's diff."
+            echo "To comply: add or update the spec for this change under ${SPEC_DIR}/ so it rides in this PR."
+            echo "Recorded escape: apply the 'no-spec:chore' label and state the reason in the PR description."
+            exit 1
+          fi
+          if [ -z "$source_touched" ]; then
+            echo "OK: not a source PR (nothing matches SRC_RE '${SRC_RE}') — spec-gate does not apply."
+          else
+            echo "OK: spec present in the diff: $(printf '%s\n' "$spec_in_diff" | head -n1)"
+          fi
+
+  # ── OPTIONAL: eval-gate ────────────────────────────────────────────────────────
+  # A second HARD gate for projects that ship agentic behavior with an eval-fixture
+  # suite that must not regress (the source repo gated the OWASP Agentic Top-10
+  # fixtures here). Any failing fixture exits non-zero and BLOCKS the merge. A
+  # legitimate, time-boxed bypass is RECORDED in profile/eval-bypasses.md — the gate
+  # still runs; the ledger only documents why a known failure was accepted.
+  # Keep this job only when ci-profile.eval_gate.enabled is true (reference: false).
+  # DELETE this whole job if you have no such suite.
+  eval-gate:
+    name: eval-gate               # <-- required status-check context if kept
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup toolchain
+        uses: <<CI_TOOLCHAIN_ACTION>>          # «stack pack: ci-profile.toolchain.id» via toolchain_map
+        with:
+          <<CI_TOOLCHAIN_INPUT>>: '<<CI_TOOLCHAIN_VERSION>>'   # «stack pack: ci-profile.toolchain.version»
+
+      # «stack pack: ci-profile.commands.restore»
+      - name: Restore
+        run: |
+          <<CI_RESTORE_CMD>>
+
+      # «stack pack: ci-profile.commands.build»
+      - name: Build
+        run: |
+          <<CI_BUILD_CMD>>
+
+      - name: Run eval fixtures (hard gate)
+        # Any failing eval fixture causes a non-zero exit and blocks the merge.
+        # Document a legitimate bypass in profile/eval-bypasses.md (the gate still runs).
+        #
+        # «stack pack: ci-profile.eval_gate.command» — the WHOLE runner invocation,
+        # including the filter, because a filter's syntax is runner-specific and means
+        # nothing without the flag that consumes it. The stack contracts to write its
+        # results into `eval-results/`, which the upload step below reads.
+        run: |
+          <<CI_EVAL_CMD>>
+
+      - name: Upload eval results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: eval-gate-results
+          path: eval-results/
+
+  dependency-gate:
+    name: dependency-gate         # <-- required status-check context (branch-protection.json)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    # ── THE STANDARD'S POSITION ON THIRD-PARTY COMPONENTS (GOLD-STANDARD §7) ───────────────
+    # This gate blocks a PR that INTRODUCES a package with a known vulnerability. It does NOT
+    # block on what was already there — the weekly dependency-scan workflow owns the standing
+    # stock and raises an issue, which rides the normal rails as an ordinary spec.
+    #
+    # That split is the whole design. Every other gate here measures the diff; a vulnerability
+    # scan measures the repo. Blocking on the repo would mean a CVE published overnight reddens
+    # every open PR the next morning, for reasons nobody caused — the exact failure that
+    # deploy-dev.yml argues against: a job red by design teaches the team red is normal, and
+    # that degrades the signal on every OTHER job. Diff-scoping keeps this one meaningful.
+    #
+    # HOW: run the stack's scan against the BASE branch and against THIS branch, then compare
+    # the two sets of findings. Set difference, not lockfile parsing — which is why one
+    # mechanism serves .NET, Node and Python without this workflow knowing anything about any
+    # of them. The normalizing is the stack pack's job (ci-profile.dependency_scan).
+    #
+    # BASE BRANCH TIP, not merge-base, deliberately: the question a merge gate answers is "what
+    # will be true after this lands that is not true now". Merge-base gets that wrong the moment
+    # someone merges main into their branch — inherited findings would be blamed on them.
+    steps:
+      - name: Checkout (full history — the base tree is scanned too)
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup toolchain
+        uses: <<CI_TOOLCHAIN_ACTION>>          # «stack pack: ci-profile.toolchain.id» via toolchain_map
+        with:
+          <<CI_TOOLCHAIN_INPUT>>: '<<CI_TOOLCHAIN_VERSION>>'   # «stack pack: ci-profile.toolchain.version»
+      # ── Scan THIS branch ────────────────────────────────────────────────────────────────────
+      # The scan command is contracted (ci-profile.dependency_scan) to print one TSV finding per
+      # line and EXIT 0 whether or not it finds anything. A non-zero exit therefore means the
+      # TOOLING broke, not that the code is vulnerable — and those need different messages.
+      - name: Scan this branch
+        run: |
+          set -uo pipefail
+          # «stack pack: ci-profile.dependency_scan.command»
+          if ! <<CI_DEPENDENCY_SCAN_CMD>> > "${RUNNER_TEMP}/head.tsv" 2> "${RUNNER_TEMP}/head.err"; then
+            echo "::error title=Dependency scan failed::The scan of THIS branch did not complete, so this gate cannot tell whether the change introduces a vulnerable package. Failing closed rather than passing unverified."
+            sed -n '1,40p' "${RUNNER_TEMP}/head.err" || true
+            exit 1
+          fi
+          sort -u -o "${RUNNER_TEMP}/head.tsv" "${RUNNER_TEMP}/head.tsv"
+          echo "Findings on this branch: $(wc -l < "${RUNNER_TEMP}/head.tsv")"
+
+      # ── Scan the BASE branch, to establish what is NOT this change's doing ───────────────────
+      - name: Scan the base branch
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -uo pipefail
+          git fetch --no-tags --quiet origin "$BASE_REF"
+          # A destructive checkout is fine here: this job exists only for the comparison, and
+          # nothing after it reads the working tree.
+          git checkout --quiet --detach "origin/$BASE_REF"
+          if ! <<CI_DEPENDENCY_SCAN_CMD>> > "${RUNNER_TEMP}/base.tsv" 2> "${RUNNER_TEMP}/base.err"; then
+            # Do NOT treat a broken baseline as "the base was clean". That would make every
+            # pre-existing finding look newly introduced and bury the real one in a false storm.
+            echo "::error title=Baseline scan failed::The scan of '$BASE_REF' did not complete, so this gate has no baseline. It cannot separate what this change introduced from what was already there."
+            sed -n '1,40p' "${RUNNER_TEMP}/base.err" || true
+            exit 1
+          fi
+          sort -u -o "${RUNNER_TEMP}/base.tsv" "${RUNNER_TEMP}/base.tsv"
+          echo "Findings already on $BASE_REF: $(wc -l < "${RUNNER_TEMP}/base.tsv")"
+
+      - name: Block on what this change introduced
+        env:
+          BLOCK_SEVERITIES: '<<CI_DEPENDENCY_BLOCK_SEVERITIES>>'
+          # An AUDITED manual override, exactly like correctness.yml's: who applied it is in the
+          # PR timeline, and the ruleset's required non-author approval still gates the merge.
+          # The label says a human decided; .github/dependency-exceptions.md says what they
+          # decided and when that acceptance expires.
+          HAS_ACCEPTED_RISK: ${{ contains(github.event.pull_request.labels.*.name, 'accepted-risk:dependency') }}
+        run: |
+          set -euo pipefail
+          # In head, not in base. comm requires both inputs sorted; both were sorted above.
+          comm -13 "${RUNNER_TEMP}/base.tsv" "${RUNNER_TEMP}/head.tsv" > "${RUNNER_TEMP}/new.tsv"
+
+          if [ ! -s "${RUNNER_TEMP}/new.tsv" ]; then
+            echo "OK: this change introduces no new vulnerable package."
+            exit 0
+          fi
+
+          echo "New relative to the base branch:"
+          cat "${RUNNER_TEMP}/new.tsv"
+
+          # CASE-INSENSITIVE on purpose: .NET renders 'High', npm renders 'high'. A case-sensitive
+          # match would silently match nothing on one of them — and a gate that matches nothing
+          # passes forever. Verified against both tools' real output, 2026-07-31.
+          awk -F'\t' -v list="$BLOCK_SEVERITIES" '
+            BEGIN { n = split(tolower(list), a, /,/)
+                    for (i = 1; i <= n; i++) { gsub(/^[ \t]+|[ \t]+$/, "", a[i]); block[a[i]] = 1 } }
+            tolower($1) in block { print }
+          ' "${RUNNER_TEMP}/new.tsv" > "${RUNNER_TEMP}/blocking.tsv"
+
+          if [ ! -s "${RUNNER_TEMP}/blocking.tsv" ]; then
+            echo "::warning title=New advisories below the blocking threshold::This change introduces packages with known advisories below $BLOCK_SEVERITIES. Reported, not blocked."
+            exit 0
+          fi
+
+          echo "Blocking ($BLOCK_SEVERITIES):"
+          while IFS=$'\t' read -r sev pkg ver url; do
+            echo "  [$sev] $pkg $ver — $url"
+          done < "${RUNNER_TEMP}/blocking.tsv"
+
+          if [ "$HAS_ACCEPTED_RISK" = "true" ]; then
+            echo "::warning::This change introduces a vulnerable package, but the 'accepted-risk:dependency' label records an accepted-risk override (audited in the PR timeline). Record the reason and an expiry in .github/dependency-exceptions.md. The branch ruleset's required non-author approval still gates the merge."
+            exit 0
+          fi
+
+          echo "::error::This change introduces a package with a known $BLOCK_SEVERITIES vulnerability. Upgrade it, drop it, or apply the 'accepted-risk:dependency' label AND record the reason and expiry in .github/dependency-exceptions.md (audited; the merge still needs the ruleset's non-author approval)."
+          exit 1

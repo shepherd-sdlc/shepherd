@@ -1,0 +1,141 @@
+# Azure DevOps CI/CD pack — manifest.
+# Realizes the core kit's rails (the-rails.md §3–§6) as Azure Pipelines, consuming the stack pack's
+# ci-profile.yaml (the SEAM). Read by the profile-aware installer to overlay this pack after the core
+# and after the chosen stack pack. Pair with any stack pack — the technology conventions live in the
+# stack pack; only the pipeline platform changes here.
+
+pack:
+  id: azure-devops
+  axis: cicd
+  name: "Azure Pipelines rails (Azure DevOps / Azure Repos)"
+  version: "0.1.0"
+
+# What this pack provides to the composition: one pipeline per gate + shared step templates + the
+# branch-policy-as-code tooling that replaces GitHub branch protection.
+provides:
+  pipelines:
+    - azure-pipelines/ci.yml               # build-and-test (+ optional eval-gate stage) — BLOCKS
+    - azure-pipelines/grader.yml           # grader — ADVISES (required to RUN, verdict never blocks)
+    - azure-pipelines/correctness.yml      # correctness-review — BLOCKS on a high-confidence defect
+    - azure-pipelines/security.yml         # security-review — BLOCKS on HIGH
+    - azure-pipelines/deploy-dev.yml        # deployment job + environment + rollback (STARTER)
+    - azure-pipelines/deploy-promote.yml   # dev→test→prod — manual only; the target Environment's
+                                           # approval check IS the human go/no-go (STARTER)
+    - azure-pipelines/dependency-scan.yml  # weekly standing-stock scan — raises a work item, never blocks
+    - azure-pipelines/rails-telemetry.yml  # weekly gate-outcome report — same schema as the github pack's
+    - azure-pipelines/eval-regression.yml  # per-PR eval-regression gate — BLOCKS
+    - azure-pipelines/eval-suite.yml       # full benchmark — manual + scheduled, ADVISORY
+  templates:
+    - azure-pipelines/templates/setup-toolchain.yml       # ci-profile.toolchain via toolchain_map
+    - azure-pipelines/templates/restore-build-test.yml    # ci-profile.commands + coverage.floor_percent
+    - azure-pipelines/templates/checkout-with-base.yml    # checkout + full base fetch for diff scope
+    - azure-pipelines/templates/claude-review.yml         # run Claude CLI → post PR thread → enforce
+  scripts:
+    - scripts/configure-branch-policies.sh  # branch-policy-as-code (analogue of apply-branch-protection.sh)
+    - scripts/run-claude-review.sh          # headless Claude Code CLI invocation (no action exists on ADO)
+    - scripts/post-pr-thread.sh             # POST/PATCH a PR thread via the ADO REST API
+  branch_policies: branch-policies/policies.json   # desired-state consumed by configure-branch-policies.sh
+  settings_fragment: settings.fragment.json        # az tooling perms + .azuredevops/ gated paths,
+                                                   # merged into .claude/settings.json
+  rails_guide: RAILS.md                            # operator's guide + shakedown drills (ADO realization)
+  mcp_fragment: mcp.fragment.json                  # Azure DevOps MCP server, merged into .mcp.json
+                                                   # (ADO_ORGANIZATION_NOT_SET is the Phase-3 placeholder —
+                                                   # a plain sentinel, not <<TOKEN>>, because it lands in an
+                                                   # argv and cmd.exe would eat the angle brackets; auth is
+                                                   # per-developer via az login — never a committed PAT)
+
+# The SEAM. This pack REALIZES the stack pack's declared commands into Azure Pipelines syntax.
+# It does not know .NET; it knows how to run whatever ci-profile.yaml declares. The realization is
+# MECHANICAL: each declared value is a `<<CI_*>>` token in the pipelines/templates that the installer
+# substitutes at compose time. ci-profile.yaml is a compose-time INPUT, never an installed file.
+consumes:
+  stack_ci_profile: ci-profile.yaml        # packs/stacks/<id>/ci-profile.yaml — toolchain + commands + coverage
+  # Neutral, platform-agnostic governance assets shared with the github pack. They are NOT re-authored
+  # here (the whole point of the two-axis model — governance content is neutral, only the platform
+  # realization changes). The core/profile layer installs them; this pack references the installed paths.
+  governance_rubrics:                       # kit/profile/rubrics/*.md
+    - grader.md
+    - correctness.md
+    - security.md
+  diff_anchors: diff-anchors.sh             # kit/profile/scripts/diff-anchors.sh — stack- and platform-neutral
+
+# The PLATFORM half of the seam: ci-profile.toolchain.id -> the Azure Pipelines task that installs it
+# and the name of that task's version input. The stack pack declares WHICH toolchain; this pack knows
+# how Azure Pipelines installs it. Fills <<CI_TOOLCHAIN_ACTION>> / <<CI_TOOLCHAIN_INPUT>>;
+# <<CI_TOOLCHAIN_VERSION>> comes from ci-profile.toolchain.version. Note the input name is NOT uniform
+# across these tasks (`version` vs `versionSpec`) — that is precisely why it is mapped, not assumed.
+# A toolchain.id absent from this map FAILS THE INSTALL CLOSED naming the id and this pack.
+# Verified against the Microsoft Learn task references (YAML syntax blocks) — task index re-checked
+# for CURRENCY and deprecation on 2026-07-16, not merely for existence:
+#   UseDotNet@2        learn.microsoft.com/azure/devops/pipelines/tasks/reference/use-dotnet-v2
+#                      Current — no UseDotNet@3 exists, no deprecation banner. (The older, separate
+#                      DotNetCoreInstaller@1 IS deprecated and on the retirement schedule; this is
+#                      its replacement, so we are on the right side of that.)
+#   UseNode@1          learn.microsoft.com/azure/devops/pipelines/tasks/reference/use-node-v1
+#                      Current. SUPERSEDES NodeTool@0, whose page states verbatim: "This version of
+#                      the task is deprecated; use UseNode@1." NodeTool@0 has no retirement date, so
+#                      it still runs — this was a currency bug, not an outage.
+#                      NOTE THE INPUT RENAME: NodeTool@0 took `versionSpec`; UseNode@1 takes
+#                      `version`. Migrating the task without the input emits a BROKEN pipeline. This
+#                      is exactly the non-uniformity the map exists to absorb — the stack pack still
+#                      just says `toolchain: {id: node, version: "24.x"}` and never learned a thing.
+#                      UseNode@1 also drops versionSource/versionFilePath (the .nvmrc path); nothing
+#                      here used them, but a repo that wants .nvmrc must hand-adapt.
+#   UsePythonVersion@0 learn.microsoft.com/azure/devops/pipelines/tasks/reference/use-python-version-v0
+#                      Current — no UsePythonVersion@1 exists, no deprecation banner. It is NOT
+#                      limited to pre-installed versions: `disableDownloadFromRegistry` defaults to
+#                      false, so it downloads a missing version from actions/python-versions. That
+#                      fallback is the fragile path (anonymous rate limits — hence its `githubToken`
+#                      input), so prefer a version the image already caches. 3.13 is cached on
+#                      ubuntu-24.04 today. Only SELF-HOSTED agents are pre-installed-only.
+# KNOWN GAP, python only — recorded rather than left to be rediscovered. Every command in
+# packs/stacks/python/ci-profile.yaml is a `uv` command, and UsePythonVersion installs Python
+# WITHOUT uv, so a Python project on Azure DevOps has no uv on PATH. The github pack solved
+# this by mapping python to setup-uv (which pins the interpreter through UV_PYTHON); there is
+# no equivalent single task here, so the fix is a script step in the setup-toolchain template
+# rather than a mapping change, and it has not been made.
+#
+# Until it is: most of those commands fail loudly on first use, which is survivable. The
+# dependency scan no longer fails quietly — the python profile's command now checks that it
+# examined something — so the dangerous half of this gap is closed even here.
+toolchain_map:
+  dotnet: { action: "UseDotNet@2",        input: "version" }
+  node:   { action: "UseNode@1",          input: "version" }
+  python: { action: "UsePythonVersion@0", input: "versionSpec" }
+
+# Overlay map: pack-relative source -> repo destination in an Azure DevOps repo.
+# The installed pipeline prompts reference the `.azuredevops/...` and `scripts/rails/...` paths below;
+# adjust the overlay if the target repo's layout differs.
+overlays:
+  - { src: azure-pipelines/ci.yml,                              dest: .azuredevops/pipelines/ci.yml }
+  - { src: azure-pipelines/grader.yml,                          dest: .azuredevops/pipelines/grader.yml }
+  - { src: azure-pipelines/correctness.yml,                     dest: .azuredevops/pipelines/correctness.yml }
+  - { src: azure-pipelines/security.yml,                        dest: .azuredevops/pipelines/security.yml }
+  - { src: azure-pipelines/deploy-dev.yml,                      dest: .azuredevops/pipelines/deploy-dev.yml }
+  - { src: azure-pipelines/deploy-promote.yml,                  dest: .azuredevops/pipelines/deploy-promote.yml }
+  - { src: azure-pipelines/dependency-scan.yml,                 dest: .azuredevops/pipelines/dependency-scan.yml }
+  - { src: azure-pipelines/rails-telemetry.yml,                 dest: .azuredevops/pipelines/rails-telemetry.yml }
+  - { src: azure-pipelines/eval-regression.yml,                 dest: .azuredevops/pipelines/eval-regression.yml }
+  - { src: azure-pipelines/eval-suite.yml,                      dest: .azuredevops/pipelines/eval-suite.yml }
+  - { src: azure-pipelines/templates/setup-toolchain.yml,       dest: .azuredevops/pipelines/templates/setup-toolchain.yml }
+  - { src: azure-pipelines/templates/restore-build-test.yml,    dest: .azuredevops/pipelines/templates/restore-build-test.yml }
+  - { src: azure-pipelines/templates/checkout-with-base.yml,    dest: .azuredevops/pipelines/templates/checkout-with-base.yml }
+  - { src: azure-pipelines/templates/claude-review.yml,         dest: .azuredevops/pipelines/templates/claude-review.yml }
+  - { src: scripts/configure-branch-policies.sh,                dest: scripts/rails/configure-branch-policies.sh }
+  - { src: scripts/run-claude-review.sh,                        dest: scripts/rails/run-claude-review.sh }
+  - { src: scripts/post-pr-thread.sh,                           dest: scripts/rails/post-pr-thread.sh }
+  - { src: branch-policies/policies.json,                       dest: .azuredevops/rails/branch-policies.json }
+  # Overlays the core's GitHub-flavored guide (last wins) so the documented path
+  # (.github/RAILS.md, referenced by /sprd-setup Step 8) holds the ADO realization.
+  - { src: RAILS.md,                                            dest: .github/RAILS.md }
+  - { src: settings.fragment.json,                              dest: .claude/settings.json, merge: true }
+  - { src: mcp.fragment.json,                                   dest: .mcp.json, merge: true }
+  # Installed by the core/profile layer, referenced here (NOT shipped by this pack — see `consumes`):
+  #   scripts/rails/diff-anchors.sh          <- kit/profile/scripts/diff-anchors.sh
+  #   .azuredevops/rails/rubrics/{grader,correctness,security}.md  <- kit/profile/rubrics/*.md
+
+# Requires a stack pack to fill the command SEAM (the <<CI_*>> tokens). Any of these satisfies it,
+# provided toolchain_map above has an entry for its toolchain.id. These are STACK PACK ids
+# (packs/stacks/<id>), not toolchain ids.
+# Reciprocal of the stack pack's requires_cicd_pack: [github, azure-devops].
+requires_stack_pack: [dotnet, node-typescript, python]

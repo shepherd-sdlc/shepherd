@@ -1,0 +1,446 @@
+# Phase Registry — SDLC Phase Orchestration
+# Defines all phases, their order, entry/exit gates, skill mapping, and artifacts.
+# Each phase produces stakeholder-reviewable artifacts + a handoff package for the next phase.
+#
+# PHASE MODEL (delivery-standard aligned):
+#   Opening (gated phases):  0 Discovery -> 1 Requirements -> 2 Design -> 3 Foundation
+#   Middle  (continuous):    build — the Build loop (Intent -> Delegate -> Discern per spec);
+#                            no artifact exit gate, a human declares feature-complete
+#   Close   (gated phases):  7 Documentation -> 8 Deployment -> 9 Monitoring -> close (Close & Transfer)
+#
+# The visible gap where 4/5/6 used to be (Implementation/Quality/Testing) is intentional:
+# batched checking is the failure mode the standard exists to kill. Checking happens
+# per change inside the Build loop, never as a later batch phase.
+#
+# IDENTITY RULES (consumed by scripts/phase_model.py — the single source of truth):
+#   - `id`     unique phase identifier; may be int (0,1,2,3,7,8,9) or string ("build","close").
+#   - `slug`   artifact directory name under .sdlc/artifacts/<slug>/. Never derived by zero-padding.
+#   - `order`  sequence position (0..N). "Next phase" = the entry with order+1. Never id+1.
+#   - `terminal` true on the final phase (no next).
+# Scripts MUST NOT assume ids are integers, contiguous, or that next = current+1.
+
+version: "2.0"
+
+phases:
+  - id: 0
+    slug: "00-discovery"
+    order: 0
+    name: discovery
+    display: "Phase 0: Discovery"
+    description: "Understand the problem space, quantify impact, map stakeholders, and define scope before writing any requirements."
+    definition: "phases/00-discovery.md"
+    skills:
+      primary: ["/plan"]
+      secondary: []
+    entry_gate:
+      conditions:
+        - "Project initiated via /sprd-setup"
+    exit_gate:
+      conditions:
+        - artifact: "constitution.md"
+          check: exists_and_complete
+        - artifact: "problem-statement.md"
+          check: exists_and_complete
+        - artifact: "success-criteria.md"
+          check: exists_and_complete
+        - artifact: "constraints.md"
+          check: exists_and_complete
+        - artifact: "phase1-handoff.md"
+          check: exists_and_complete
+        # The judgement calls. Every condition above is "a file exists and has no TODO in it",
+        # which is not what Discovery is for — the approver was shown a file list and asked to
+        # sign. These are the questions that actually decide whether Discovery is done, and G7
+        # puts them in front of the person signing.
+        - check: "Scope boundaries are unambiguous — a reader can say what is NOT being built"
+        - check: "success-criteria.md has at least 3 measurable dimensions with pass/fail thresholds, each with a named source it will be read from"
+        - check: "Every persona is a real person or role the human named — none invented to fill the table"
+        - check: "project_type is recorded in state.yaml (it selects the later-phase templates)"
+    artifacts:
+      required:
+        - "constitution.md"
+        - "problem-statement.md"
+        - "success-criteria.md"
+        - "constraints.md"
+        - "phase1-handoff.md"
+      optional:
+        - "stakeholder-notes.md"
+        - "market-research.md"
+        - "document-registry.md"  # Document intake index (opt-in via profile.documentation)
+        - "00-discovery-report.html"
+        - "po-decision-record.md"
+        - "tooling-record.md"
+        - "workshop-brief.md"
+
+  - id: 1
+    slug: "01-requirements"
+    order: 1
+    name: requirements
+    display: "Phase 1: Requirements"
+    description: "Decompose the problem into functional and non-functional requirements with user stories and acceptance criteria."
+    definition: "phases/01-requirements.md"
+    skills:
+      primary: ["/deep-project"]
+      secondary: ["/plan"]
+    entry_gate:
+      conditions:
+        - "Phase 0 exit gate passed"
+        - "phase1-handoff.md reviewed"
+    exit_gate:
+      conditions:
+        - artifact: "requirements.md"
+          check: exists_and_complete
+        - artifact: "non-functional-requirements.md"
+          check: exists_and_complete
+        - artifact: "epics.md"
+          check: exists_and_complete
+        - artifact: "phase2-handoff.md"
+          check: exists_and_complete
+        # As with Phase 0: the artifact checks confirm files exist, not that requirements are
+        # ready to design from. These are what the approver actually has to judge.
+        - check: "Every architectural implication appears in phase2-handoff.md as a numbered AQ-NN under 'What Design Must Address' — Phase 2's opening gate has no other input"
+        - check: "No unresolved P0 conflicts or ambiguities between stakeholders"
+        - check: "Every numeric NFR threshold states its Measurement Basis, and each [aspirational] one has an agreed Build-loop measurement method with a named owner"
+        - check: "Every P0 requirement traces to a Phase 0 pain point"
+        # The decision log is phase-spanning and lives at .sdlc/decision-log.md, outside this
+        # phase's artifact directory — so the gate cannot see it and the question is the only
+        # mechanism available. Same pattern as the close phase's off-gate receipts.
+        - check: "Every open product decision is recorded in .sdlc/decision-log.md as a DL-NN with a named owner and a due date — an entry with no owner is the failure this log exists to prevent"
+        # Discipline seats (conditional): the gate cannot know whether the trigger applied, so it asks.
+        - check: "If an epic spans surfaces or personas: feature-brief.md exists and every row (channel, persona, tier) was confirmed by a named human — one channel per spec"
+        - check: "If the feature encodes policy: every BR-NN in business-rules.md has a named approver and a signed outcome or a DL-NN; discipline sign-offs recorded at the advance"
+    artifacts:
+      required:
+        - "requirements.md"
+        - "non-functional-requirements.md"
+        - "epics.md"
+        - "phase2-handoff.md"
+      optional:
+        - "glossary.md"
+        - "01-requirements-report.html"
+        - "scope-out-record.md"
+        - "adversarial-review-record.md"
+        # Discipline seats — conditional, not optional: present when their trigger applies
+        - "feature-brief.md"
+        - "business-rules.md"
+        - "golden-scenarios.md"
+
+  - id: 2
+    slug: "02-design"
+    order: 2
+    name: design
+    display: "Phase 2: Design"
+    description: "Create software architecture, API contracts, data models, and Architecture Decision Records."
+    definition: "phases/02-design.md"
+    skills:
+      primary: ["/deep-plan"]
+      secondary: ["/plan"]
+    entry_gate:
+      conditions:
+        - "Phase 1 exit gate passed"
+        - "phase2-handoff.md reviewed"
+    exit_gate:
+      conditions:
+        - artifact: "design-doc.md"
+          check: exists_and_complete
+        - artifact: "api-contracts.md"
+          check: exists_and_complete
+        - artifact: "adrs/"
+          check: exists_and_complete
+        - artifact: "adr-registry.md"
+          check: exists_and_complete
+        - artifact: "phase3-handoff.md"
+          check: exists_and_complete
+        # Neither of these is a hard artifact gate — the first is RECOMMENDED, the second only
+        # exists when /deep-plan ran. They sat in the phase body's Exit Criteria looking
+        # mandatory while nothing checked them. Stated here, the approver at least SEES them.
+        - check: "Architecture diagrams rendered as HTML (not ASCII art), if the design warrants them"
+        - check: "If /deep-plan was used: deep-plan-checkpoint.yaml is present for Phase 3 to resume from"
+        - check: "Design-level threat review done and its guarded-path map accepted by a named human (threat-model.md) — Phase 3 wires its security gates from this"
+        # Discipline seats (conditional): the gate cannot know whether the trigger applied, so it asks.
+        - check: "If the feature touches personal data: data/data-contract.md carries a PII column confirmed by a named human, and every dependent spec's risk tier reflects it"
+        - check: "If the feature has a customer surface: experience/user-journey.md and experience/channel-interaction-spec.md are signed, Engineering co-signing the contract; discipline sign-offs recorded at the advance"
+    artifacts:
+      required:
+        - "design-doc.md"
+        - "api-contracts.md"
+        - "adrs/"
+        - "adr-registry.md"
+        - "phase3-handoff.md"
+        - "spike-findings.md"
+        - "threat-model.md"
+        - "nfr-proving-plan.md"
+        - "walking-skeleton-definition.md"
+      optional:
+        - "data-model.md"
+        - "sequence-diagrams.md"
+        - "02-design-report.html"
+        - "research-notes.md"
+        - "integration-notes.md"
+        - "external-reviews/"
+        - "deep-plan-checkpoint.yaml"
+        - "consistency-check-record.md"
+        # Discipline seats — conditional, not optional: present when their trigger applies
+        - "data/data-contract.md"
+        - "data/data-readiness.md"
+        - "data/lineage-audit.md"
+        - "experience/user-journey.md"
+        - "experience/surface-layout.md"
+        - "experience/channel-interaction-spec.md"
+
+  - id: 3
+    slug: "03-foundation"
+    order: 3
+    name: foundation
+    display: "Phase 3: Foundation"
+    description: "Build the factory: install and adapt the harness, stand up the rails (CI/CD + gates) and dev infrastructure, and run a thin walking skeleton end-to-end through the full Build loop into the dev environment. The hinge where documents stop and software starts."
+    definition: "phases/03-foundation.md"
+    skills:
+      primary: []
+      secondary: ["/tdd", "/e2e"]
+    entry_gate:
+      conditions:
+        - "Phase 2 exit gate passed"
+        - "phase3-handoff.md reviewed"
+    exit_gate:
+      conditions:
+        - artifact: "foundation-report.md"
+          check: exists_and_complete
+        - artifact: "risk-tier-map.md"
+          check: exists_and_complete
+        - artifact: "cadence-plan.md"
+          check: exists_and_complete
+        - artifact: "build-handoff.md"
+          check: exists_and_complete
+        - check: "Walking skeleton deployed to the dev environment through the real pipeline and verified"
+        - check: "The rails are proven, not just present (Stop hook blocks, gates fire, deploy rolls back)"
+        - check: "At least one HIGH-risk spec has run the full Build loop"
+    artifacts:
+      required:
+        - "foundation-report.md"
+        - "risk-tier-map.md"
+        - "cadence-plan.md"
+        - "build-handoff.md"
+        - "data-flow-brief.md"
+      optional:
+        - "harness-inventory.md"
+        - "pipeline-proof.md"
+        - "walking-skeleton-spec.md"
+        - "03-foundation-report.html"
+
+  - id: build
+    slug: "build"
+    order: 4
+    name: build
+    display: "Build Loop"
+    description: "The continuous middle of the engagement. Every change runs the same three beats — Intent (decide + write a spec), Delegate (bound + build from an approved plan), Discern (prove against the spec by someone other than the author, then merge). Replaces the batch Implementation/Quality/Testing phases; there is no artifact exit gate — checking happens per change, and a human declares the backlog feature-complete to leave."
+    definition: "phases/build-loop.md"
+    continuous: true
+    skills:
+      primary: []
+      secondary: ["/tdd", "/code-review", "/e2e"]
+    entry_gate:
+      conditions:
+        - "Phase 3 (Foundation) exit gate passed"
+        - "build-handoff.md reviewed"
+        - "Rails proven and walking skeleton deployed"
+    exit_gate:
+      conditions:
+        - check: "Build backlog is feature-complete (human declaration — no batch artifact gate)"
+        - artifact: "phase7-handoff.md"
+          check: exists_and_complete
+    artifacts:
+      required:
+        - "phase7-handoff.md"
+      optional:
+        - "specs/"
+        - "spikes/"              # written findings from bounded spikes (Build loop §3a); the
+                                 # spike code is thrown away, the finding is the durable record
+        - "build-summary.md"
+        - "hardening-pass-notes.md"
+        - "steering-scorecard.md"
+
+  - id: 7
+    slug: "07-documentation"
+    order: 5
+    name: documentation
+    display: "Phase 7: Documentation"
+    description: "Prove that someone who isn't the pod can understand, run, and operate the system from its documentation alone — verified by cold use, not by reading. README, API docs, and RUNBOOK current before deployment."
+    definition: "phases/07-documentation.md"
+    skills:
+      primary: ["/update-docs"]
+      secondary: []
+    entry_gate:
+      conditions:
+        - "Build loop feature-complete"
+        - "phase7-handoff.md reviewed"
+    exit_gate:
+      conditions:
+        - artifact: "README.md"
+          check: exists_and_complete
+        - artifact: "api-docs.md"
+          check: exists_and_complete
+        - artifact: "RUNBOOK.md"
+          check: exists_and_complete
+        - artifact: "phase8-handoff.md"
+          check: exists_and_complete
+        - check: "README cold checkout completed by someone new to the repo, unassisted"
+        - check: "RUNBOOK deploy + rollback + one failure scenario executed cold by the ops engineer"
+    artifacts:
+      required:
+        # Every project has a README, so every project gets the cold verification.
+        - "readme-verification.md"
+        # But only something that is operated has a RUNBOOK to walk. Mirrors RUNBOOK.md below —
+        # requiring the receipt for a project with no runbook would re-create D-3 for the receipt.
+        - path: "runbook-walkthrough.md"
+          required_for: [service, app]
+        # README and RUNBOOK are the repo's REAL files, not copies under .sdlc/. Phase 7 tells
+        # the team to test the README against a fresh clone; checking a copy would validate a
+        # file no stranger ever reads, and the copy drifts from the original by the next commit.
+        - path: "README.md"
+          root: repo
+        # Skipped for `skill` projects — no endpoints to document (see 07-documentation.md).
+        - path: "api-docs.md"
+          required_for: [service, app, library, cli]
+        # Skipped unless something is actually operated. A library, CLI or skill has no server
+        # to run, and the phase body says so; the gate has to agree or it blocks on nothing.
+        - path: "RUNBOOK.md"
+          root: repo
+          required_for: [service, app]
+        - "phase8-handoff.md"
+      optional:
+        - "CHANGELOG.md"
+        - "CONTRIBUTING.md"
+        - "drift-catalog.md"
+        - "07-documentation-report.html"
+        - "spec-audit-record.md"
+
+  - id: 8
+    slug: "08-deployment"
+    order: 6
+    name: deployment
+    display: "Phase 8: Deployment"
+    description: "Promote to production through the pipeline that has existed since Foundation. Adds the rollout decision, the rehearsal, and a named human saying go. A good Phase 8 is boring — it invents nothing."
+    definition: "phases/08-deployment.md"
+    skills:
+      primary: ["/e2e"]
+      secondary: []
+    entry_gate:
+      conditions:
+        - "Phase 7 exit gate passed"
+        - "phase8-handoff.md reviewed"
+    exit_gate:
+      conditions:
+        - artifact: "release-notes.md"
+          check: exists_and_complete
+        - artifact: "deployment-checklist.md"
+          check: exists_and_complete
+        - artifact: "smoke-test-results.md"
+          check: exists_and_complete
+        - artifact: "phase9-handoff.md"
+          check: exists_and_complete
+        - check: "Rollback rehearsed in test by the client's operators before production promotion"
+        - check: "Recorded go/no-go with every named role asked and answered"
+        - check: "Production smoke tests passing"
+    artifacts:
+      required:
+        - "release-notes.md"
+        - "deployment-checklist.md"
+        - "smoke-test-results.md"
+        - "phase9-handoff.md"
+        - "rollback-rehearsal.md"
+        - "go-no-go-record.md"
+        - "secrets-rotation-record.md"
+      optional:
+        - "rollback-procedure.md"
+        - "deployment-log.md"
+        - "08-deployment-report.html"
+        - "rollout-shape-decision.md"
+
+  - id: 9
+    slug: "09-monitoring"
+    order: 7
+    name: monitoring
+    display: "Phase 9: Monitoring"
+    description: "Make production observable, make alerts real (thresholds from measured baselines), prove incident response by drill, and capture the engagement retrospective (the harvest raw material)."
+    definition: "phases/09-monitoring.md"
+    skills:
+      primary: []
+      secondary: ["/session-insights"]
+    entry_gate:
+      conditions:
+        - "Phase 8 exit gate passed"
+        - "phase9-handoff.md reviewed"
+    exit_gate:
+      conditions:
+        - artifact: "monitoring-config.md"
+          check: exists_and_complete
+        - artifact: "alert-definitions.md"
+          check: exists_and_complete
+        - artifact: "incident-response.md"
+          check: exists_and_complete
+        - artifact: "project-retrospective.md"
+          check: exists_and_complete
+        - artifact: "close-handoff.md"
+          check: exists_and_complete
+        - check: "Every alert threshold derived from a measured baseline (or flagged modeled, with revisit date)"
+        - check: "Alert drill executed: every critical alert fired and answered from the playbook"
+    artifacts:
+      required:
+        - "monitoring-config.md"
+        - "alert-definitions.md"
+        - "incident-response.md"
+        - "project-retrospective.md"
+        - "close-handoff.md"
+        - "drill-record.md"
+      optional:
+        - "baseline-data.md"
+        - "09-monitoring-report.html"
+        - "what-healthy-table.md"
+        - "fatigue-review-record.md"
+        - "outcome-metric-first-read.md"
+
+  - id: close
+    slug: "close"
+    order: 8
+    terminal: true
+    name: close
+    display: "Phase C: Close & Transfer"
+    description: "Prove the client can run all of it without the pod — system, harness, loop, and judgment — by observed, unassisted use; then exit cleanly and feed the standard. The close gate: the client team ran one real spec end-to-end without us driving."
+    definition: "phases/close.md"
+    skills:
+      primary: []
+      secondary: []
+    entry_gate:
+      conditions:
+        - "Phase 9 exit gate passed"
+        - "close-handoff.md reviewed"
+    exit_gate:
+      conditions:
+        - artifact: "final-handoff-report.md"
+          check: exists_and_complete
+        - artifact: "harness-audit.md"
+          check: exists_and_complete
+        - artifact: "close-gate-evidence.md"
+          check: exists_and_complete
+        - artifact: "access-revocation-checklist.md"
+          check: exists_and_complete
+        - check: "Close gate: client team ran one real spec end-to-end (triage->spec->delegate->grade->merge->deploy) without the pod driving, observed and unassisted"
+        - check: "Pod access revoked and confirmed against the client's audit trail"
+        - check: "Harvest PR opened against the delivery-standard repo"
+        # Three receipts that exist as optional artifacts and nothing ever asked about. They do
+        # not block — but the last person to touch this engagement should be asked, once, whether
+        # each happened. Two of them live outside .sdlc/ entirely, so the gate cannot see them at
+        # all; the question is the only mechanism available.
+        - check: "Outcomes dashboard re-pointed to client ownership, caveats intact, with the quarter-read date in their calendar (outcomes-dashboard-handover.md)"
+        - check: "Harvest notes recorded locally — the PR itself lands in another repo this gate cannot see (harvest-pr-notes.md)"
+        - check: "The engagement retro is written in the delivery-standard repo, and this record links to it"
+    artifacts:
+      required:
+        - "final-handoff-report.md"
+        - "harness-audit.md"
+        - "close-gate-evidence.md"
+        - "access-revocation-checklist.md"
+      optional:
+        - "outcomes-dashboard-handover.md"
+        - "harvest-pr-notes.md"
+        - "close-report.html"

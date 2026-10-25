@@ -1,0 +1,64 @@
+name: CI
+
+# Shepherd Free's own checks.
+#
+#   test         — the full pytest suite. BLOCKS.
+#   test-windows — the same suite on windows-latest: the plugin ships PowerShell hooks, so a
+#                  Linux-only run cannot see console-encoding or line-ending faults. BLOCKS.
+#   actionlint   — lints the workflows the harness emits, composed with the starter profile and
+#                  token-stubbed the way a real repository would run them. BLOCKS.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.3.2
+      - run: uv run --project scripts pytest scripts/tests -q
+
+  test-windows:
+    name: pytest (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.3.2
+      - run: uv run --project scripts pytest scripts/tests -q
+
+  actionlint:
+    name: actionlint (emitted workflows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v8.3.2
+      - name: Compose the starter install
+        run: |
+          uv run --project scripts scripts/install_harness.py \
+            --payload harness --target /tmp/golden-repo \
+            --profile profiles/starter/profile.yaml
+      - name: Stub adaptation tokens
+        # The emitted workflows carry <<TOKENS>> a repository fills during adaptation; stub
+        # them so actionlint sees the adapted shape.
+        run: sed -i -E 's/<<[^>]+>>/STUB/g; s/<PLACEHOLDER>/STUB/g' /tmp/golden-repo/.github/workflows/*.yml
+      - name: Lint emitted workflows
+        # Pinned and checksum-verified. shellcheck is off: the run: bodies are stack-templated
+        # references, not final shell.
+        run: |
+          set -euo pipefail
+          curl -fsSL -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -shellcheck= /tmp/golden-repo/.github/workflows/*.yml
