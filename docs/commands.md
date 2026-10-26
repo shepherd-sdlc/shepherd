@@ -17,6 +17,7 @@ Comprehensive documentation for all slash commands provided by the Shepherd plug
 - [/sprd-coach -- Interactive Phase Coaching](#sprd-coach----interactive-phase-coaching)
 - [/sprd-review -- Multi-Perspective Review](#sprd-review----multi-perspective-review)
 - [/sprd-spec -- Author a Ready Spec](#sprd-spec----author-a-ready-spec)
+- /sprd-report-issue -- see [Additional Commands](#additional-commands-summaries)
 - [Additional Commands (summaries)](#additional-commands-summaries)
 - [Command Interaction Flow](#command-interaction-flow)
 - [Python Script Invocation](#python-script-invocation)
@@ -41,6 +42,7 @@ Comprehensive documentation for all slash commands provided by the Shepherd plug
 | `/sprd-handoff` | Hand a ready spec to a developer in one step | Writes the branch + `status`/`developer` frontmatter commit; assigns on the code host (GitHub via `gh`, chosen by the `origin` remote) | The Build-loop Delegate beat, right after `/sprd-spec`; also runs standalone via `--repo` |
 | `/sprd-spec-status` | Report a spec's status read from its pull request | Writes `status: merged` on the default branch, once, when the PR has actually merged (`--all` never writes) | The Build-loop Discern beat, to see where a change is and who it's waiting on; also runs standalone via `--repo` |
 | `/sprd-spike` | Open a bounded spike for a question nobody can answer yet | Writes `spikes/NNNN-name.md` | When a story fails the Definition of Ready because the ground truth is unknown, not because the spec is badly written |
+| `/sprd-report-issue` | Bugs in the product, from report to fix — a report that carries the minimum a fixer needs (channel, environment, severity, data impact, type of user, a real screenshot, a privacy statement), reviewed by someone other than the reporter, prioritized P1–P3 with a target sprint, promoted to a `type: bugfix` spec a sprint can slate; `sync` on merge; `file` to the code host after a dry run | Writes `.sdlc/issues/ISS-NNNN-<slug>.md` + screenshots, `issue-log.jsonl`; `promote` runs `new_spec.py`; `--escaped-from` records `scorecard.py`'s `escaped_bug`; **never `state.yaml`** | Whenever anyone — tester, builder, checker, Product, a client stakeholder — sees the product misbehave; the Mon/Wed/Fri review triages the queue; also standalone via `--repo`; the Shepherd desktop app's *Issues* view is the same model |
 | `/sprd-doctor` | Day-1 environment check — proves the installed harness can actually run here; pack-aware, checks `gh` on GitHub installs and `az` on Azure DevOps installs, never the other (the PR-facing commands pick their CLI from the `origin` remote instead) | No | After `/sprd-setup`, when onboarding a second developer, and any time a gate behaves inexplicably |
 
 
@@ -615,7 +617,7 @@ The Build loop's Intent beat — before building any change. A spec that `check_
 
 ## Additional Commands (summaries)
 
-Six commands have their full flow documented in their command files rather than here.
+Seven commands have their full flow documented in their command files rather than here.
 One line each; see `commands/<name>.md` for the complete instructions.
 
 | Command | What it does |
@@ -626,6 +628,7 @@ One line each; see `commands/<name>.md` for the complete instructions.
 | `/sprd-doctor` | Verify the installed harness will actually run in this repo — interpreters present, rails scripts executable, required secrets set, branch protection active — and print the fix for anything that will not. **Pack-aware:** reads the installed CI/CD pack from the harness manifest and checks GitHub installs with `gh` (repo secrets, ruleset), Azure DevOps installs with `az` (variable groups read from the installed pipelines, branch policies) — never asks a repo to install the other platform's CLI. The harness fails quietly; this is what makes it fail loudly |
 | `/sprd-harness` | Install or refresh the delivery harness independent of a full `/sprd-setup` |
 | `/sprd-upgrade` | Bring an installed harness forward safely using the install manifest — updates factory-original files, preserves adaptations, surfaces both-sides changes as `.harness-new` siblings to merge |
+| `/sprd-report-issue` | Bugs in the product the team is building, as records that become specs: an `AskUserQuestion` interview over `issue_model.py`'s plan (title, what / expected / steps, the product's channel with its follow-ups, environment and build, severity, frequency, data impact, the type of user and the reporter's role, one screenshot that is an image by its bytes, the privacy statement) writes nothing until the minimum is met (exit 1 lists every gap; an AI name or a token-shaped string is exit 2). Then `triage` by someone other than the reporter, `prioritize` P1–P3 with an open target sprint, `promote` to a `type: bugfix` spec through `new_spec.py` with `--slate` into the sprint (agent proposes tier and priority, a named human confirms), `sync` to `fixed` when the spec merges, `note`, `reopen`, `show` (allowed actions and why not), `list --queue`, and `file` → `gh issue create` / `az boards work-item create --type Bug` after `--dry-run`. `references/issue-lifecycle.md` |
 
 ---
 

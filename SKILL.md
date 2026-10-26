@@ -36,6 +36,7 @@ This plugin makes structured SDLC methodology executable in Claude Code. It prov
 | `/sprd-spec` | Author a ready Build-loop spec (`specs/NNNN-name.md`) and enforce the Definition of Ready |
 | `/sprd-handoff` | Hand a ready spec to a developer — branch, frontmatter, code-host assignment, starting the agent |
 | `/sprd-spec-status` | Report a spec's status read from its pull request — checks, grader verdict, approvals, merge |
+| `/sprd-report-issue` | Bugs in the product, from report to fix — an interview that forces the minimum a fixer needs (what / expected / steps, the product's channel with its follow-ups, environment and build, severity, frequency, data impact, the type of user and your role, a real screenshot, a privacy statement); reviewed by someone other than the reporter, prioritized P1–P3 with a target sprint, promoted to a `type: bugfix` spec that `--slate` puts into the sprint; `sync` marks it fixed when the spec merges; `file` opens it on GitHub / Azure DevOps |
 | `/sprd-review` | Multi-perspective artifact review (council, adversarial, or edge-case modes) |
 | `/sprd-phase-report` | Generate phase HTML report with artifact inventory and gate results |
 

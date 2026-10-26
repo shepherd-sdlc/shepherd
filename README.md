@@ -161,6 +161,7 @@ For in-depth technical documentation, see the guides in [`docs/`](docs/):
 | `/sprd-spike` | Open a bounded spike for a question nobody can answer yet |
 | `/sprd-handoff` | Hand a ready spec to a developer in one step — branch, frontmatter, draft PR, reviewer request |
 | `/sprd-spec-status` | Where a spec is and who it is waiting on, read from its pull request |
+| `/sprd-report-issue` | Bugs in the product, from report to fix — forced minimum (what / expected / steps / channel / environment / severity / frequency / data impact / type of user / role / a real screenshot / a privacy statement), review by someone else, P1–P3 with a target sprint, promotion to a `type: bugfix` spec slated into the sprint, `sync` on merge, filing to GitHub or Azure DevOps |
 | `/sprd-phase-report` | Generate phase HTML report with artifact inventory |
 | `/sprd-review` | Multi-perspective artifact review (council, adversarial, or edge-case modes) |
 | `/sprd-doctor` | Day-1 environment check — proves the installed harness can actually run here |
@@ -239,7 +240,7 @@ Gates have severity levels:
 shepherd/
 ├── plugin.json              # Plugin manifest
 ├── SKILL.md                 # Main skill entry point
-├── commands/                # Slash commands (/sprd, /sprd-setup, /sprd-status, /sprd-next, /sprd-gate, /sprd-enhance, /sprd-coach, /sprd-review, /sprd-spec, /sprd-spike, /sprd-handoff, /sprd-spec-status, /sprd-doctor, /sprd-harness, /sprd-phase-report, /sprd-upgrade)
+├── commands/                # Slash commands (/sprd, /sprd-setup, /sprd-status, /sprd-next, /sprd-gate, /sprd-enhance, /sprd-coach, /sprd-review, /sprd-spec, /sprd-spike, /sprd-handoff, /sprd-spec-status, /sprd-report-issue, /sprd-doctor, /sprd-harness, /sprd-phase-report, /sprd-upgrade)
 ├── agents/                  # Agents (orchestrator, requirements-analyst, compliance-checker, section-evaluator, narrative-enhancer, gate-repair, multi-reviewer)
 ├── profiles/                # Company/stack YAML profiles
 ├── phases/                  # Phase definitions (0,1,2,3,build,7,8,9,close)

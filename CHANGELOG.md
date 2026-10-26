@@ -8,5 +8,8 @@ so this changelog starts here rather than carrying the source's history.
 - **The phase lifecycle**: discovery to close, each phase with its documents, gates and sign-off.
 - **Specs as the unit of Build work**: one spec, one branch, one pull request, with a Definition
   of Ready enforced before work starts and a risk tier that sets how much checking it needs.
+- **Bug reports as records** (`/sprd-report-issue`): an interview that captures what a fixer needs,
+  review by someone other than the reporter, a priority, promotion to a bugfix spec, and filing on
+  GitHub.
 - **The delivery harness**, installed by `/sprd-harness`: CI rails, hooks, agents and skills.
 - **The `starter` profile**, and the schema any company's own profile is validated against.

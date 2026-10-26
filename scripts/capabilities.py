@@ -115,6 +115,30 @@ CAPABILITIES: dict[str, dict] = {
     "ado-reconcile": {"script": "ado_sync.py", "argv": ["reconcile"],
                       "flags": ["--repo", "--state", "--json", "--field", "--take", "--by", "--owner", "--reason",
                                 "--from-comment"]},
+    # /sprd-report-issue: bugs in the product, from report to a bugfix spec. The app's Issues
+    # view and its Report-an-issue dialog read the question plan and the build facts from the plugin,
+    # write through `new`, decide through `triage` / `prioritize` / `promote`, and file through
+    # `file` — each disabled on an older plugin with the reason naming the capability.
+    "issue-questions": {"script": "report_issue.py", "argv": ["questions"], "flags": ["--channel", "--json"]},
+    "issue-env": {"script": "report_issue.py", "argv": ["env"], "flags": ["--repo", "--state", "--app-version", "--json"]},
+    "issue-report": {"script": "report_issue.py", "argv": ["new"],
+                     "flags": ["--title", "--channel", "--what", "--expected", "--steps", "--environment", "--severity", "--frequency",
+                               "--data-impact", "--persona", "--reporter-role", "--screenshot", "--no-client-data", "--answer",
+                               "--env-json", "--escaped-from", "--by", "--json"]},
+    "issue-list": {"script": "report_issue.py", "argv": ["list"], "flags": ["--repo", "--state", "--status", "--queue", "--json"]},
+    "issue-show": {"script": "report_issue.py", "argv": ["show"], "flags": ["--issue", "--json"]},
+    "issue-triage": {"script": "report_issue.py", "argv": ["triage"],
+                     "flags": ["--issue", "--verdict", "--severity", "--data-impact", "--question", "--of", "--reason", "--override", "--by"]},
+    "issue-prioritize": {"script": "report_issue.py", "argv": ["prioritize"], "flags": ["--issue", "--priority", "--target-sprint", "--reason", "--by"]},
+    "issue-promote": {"script": "report_issue.py", "argv": ["promote"], "flags": ["--issue", "--risk", "--owner", "--team", "--slate", "--by"]},
+    "issue-sync": {"script": "report_issue.py", "argv": ["sync"], "flags": ["--repo", "--state", "--json"]},
+    "issue-file": {"script": "report_issue.py", "argv": ["file"], "flags": ["--issue", "--host", "--label", "--dry-run", "--by", "--json"]},
+    # The issue -> Azure Boards bridge (docs/proposals/issue-boards-bridge.md): the feature picker reads `features`,
+    # a report's feature is named or changed through `set-feature`, and `new --to-boards` runs the mirror's own
+    # `plan` for the report it just wrote — a named person confirms the apply; nothing here sends it.
+    "issue-features": {"script": "report_issue.py", "argv": ["features"], "flags": ["--repo", "--state", "--spec", "--json"]},
+    "issue-set-feature": {"script": "report_issue.py", "argv": ["set-feature"], "flags": ["--issue", "--feature", "--by", "--reason", "--json"]},
+    "issue-to-boards": {"script": "report_issue.py", "argv": ["new"], "flags": ["--feature", "--to-boards"]},
 }
 
 

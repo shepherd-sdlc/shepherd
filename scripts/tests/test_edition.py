@@ -8,6 +8,7 @@ same tests run unchanged.
 
 from __future__ import annotations
 
+import json
 import sys
 from types import SimpleNamespace
 
@@ -18,9 +19,11 @@ import edition
 import gate_auth as ga
 import handoff as h
 import project_settings as ps
+import report_issue as ri
 import set_setting as st
 import spec_status as ss
 from github_import import GitHubImportError
+from tests.test_report_issue import repo, shot, triaged  # noqa: F401  (fixtures)
 
 NEEDS_PRO = "needs Shepherd Pro"
 
@@ -94,3 +97,66 @@ class TestChangeApprovalWithoutPro:
             st.set_approval(tmp_path, "requirements", True, "@priya-n")
         assert exc.value.kind == "pro_required"
         assert not (tmp_path / ".sdlc").exists()
+
+
+BOARD_MODULES = ("boards_contract", "ado_sync_model", "ado_transport", "ado_wit_map", "ado_sync_sources")
+
+
+@pytest.fixture
+def no_boards(monkeypatch, tmp_path):
+    """Issue reporting without the Azure Boards mirror, as in Shepherd Free: its modules unimportable
+    and its script absent."""
+    for name in BOARD_MODULES:
+        monkeypatch.setitem(sys.modules, name, None)
+    monkeypatch.setattr(ri, "MIRROR_SCRIPT", tmp_path / "absent" / "ado_sync.py")
+
+
+class TestIssueReportingWithoutPro:
+    """A report still files on GitHub; only the board parts say they need Pro."""
+
+    def test_a_reports_board_link_is_simply_absent(self, tmp_path, no_boards):
+        assert ri._mirror_files() is None
+        assert ri._board_links(tmp_path) == {}
+
+    def test_sending_a_report_to_the_board_says_pro_is_needed(self, tmp_path, no_boards):
+        plan = ri.boards_plan(SimpleNamespace(), tmp_path, "ISS-0001")
+        assert plan["planned"] is False and plan["reason"] == "Azure Boards needs Shepherd Pro"
+        assert ri._boards_refusal("azure-devops") == "Azure Boards needs Shepherd Pro"
+        assert ri._boards_refusal("github") == "the repository's host is github"
+
+    def test_listing_features_says_pro_is_needed(self, tmp_path, no_boards):
+        with pytest.raises(ri.NotDone, match=NEEDS_PRO):
+            ri.features_doc(tmp_path, None)
+
+    def test_the_feature_briefs_are_read_only_through_pro(self, tmp_path, no_boards):
+        with pytest.raises(edition.ProRequired, match=NEEDS_PRO):
+            ri._feature_rows(tmp_path)
+
+
+class TestSprintsWithoutPro:
+    """Without `sprint.py` a report is still prioritized and promoted; only the sprint parts say they
+    need Pro, instead of passing on a missing script's error."""
+
+    @pytest.fixture
+    def no_sprints(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(ri, "SPRINT_SCRIPT", tmp_path / "absent" / "sprint.py")
+
+    def _run(self, capsys, *args) -> tuple[int, dict]:
+        code = ri.main([*args, "--json"])
+        return code, json.loads(capsys.readouterr().out)
+
+    def test_a_target_sprint_is_recorded_as_typed_naming_pro(self, repo, shot, no_sprints, capsys):
+        triaged(repo, shot)
+        code, doc = self._run(capsys, "prioritize", "--repo", str(repo), "--issue", "ISS-0001", "--priority", "P2",
+                              "--target-sprint", "S08", "--by", "Sam K")
+        assert code == 0 and doc["target_sprint"] == "S08"
+        assert doc["warnings"] == ["Sprints need Shepherd Pro; S08 is recorded as typed"]
+
+    def test_slate_promotes_the_report_and_says_the_spec_was_not_slated(self, repo, shot, no_sprints, capsys):
+        triaged(repo, shot)
+        assert self._run(capsys, "prioritize", "--repo", str(repo), "--issue", "ISS-0001", "--priority", "P2",
+                         "--by", "Sam K")[0] == 0
+        code, doc = self._run(capsys, "promote", "--repo", str(repo), "--issue", "ISS-0001", "--risk", "MEDIUM",
+                              "--slate", "--by", "Sam K")
+        assert code == 0 and doc["status"] == "promoted" and doc["slated"] is None
+        assert doc["warnings"] == [f"Sprints need Shepherd Pro; spec {doc['spec']} was not slated"]
