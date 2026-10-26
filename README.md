@@ -48,7 +48,7 @@ No existing tool combines specification-driven development + quality enforcement
 One marketplace add, one install — brings the orchestration commands **and** the delivery harness:
 
 ```
-/plugin marketplace add MCKRUZ/shepherd
+/plugin marketplace add shepherd-sdlc/shepherd
 /plugin install shepherd@mckruz
 ```
 
@@ -63,7 +63,7 @@ harness in an existing repo, use `/sprd-harness`. Requires Claude Code v2.1.196+
 
 ```bash
 # Clone the repo
-git clone https://github.com/MCKRUZ/shepherd.git
+git clone https://github.com/shepherd-sdlc/shepherd.git
 
 # Symlink to your Claude Code skills directory
 # Windows

@@ -32,8 +32,8 @@ registry inside it. The marketplace entry (`.claude-plugin/marketplace.json`) de
   "version": "1.3.0",
   "description": "SDLC orchestration for Claude Code + one-command install of the full delivery harness (...)",
   "author": { "name": "Matt Kruczek", "url": "https://github.com/MCKRUZ" },
-  "homepage": "https://github.com/MCKRUZ/shepherd",
-  "repository": "https://github.com/MCKRUZ/shepherd",
+  "homepage": "https://github.com/shepherd-sdlc/shepherd",
+  "repository": "https://github.com/shepherd-sdlc/shepherd",
   "license": "UNLICENSED",
   "keywords": ["sdlc", "lifecycle", "compliance", "quality", "orchestration", "..."]
 }

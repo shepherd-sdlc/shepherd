@@ -18,7 +18,7 @@ first install.
 The kit ships inside the **`shepherd` plugin**, which lays it down for you:
 
 ```
-/plugin marketplace add MCKRUZ/shepherd
+/plugin marketplace add shepherd-sdlc/shepherd
 /plugin install shepherd@mckruz
 # then, per repo:
 /sprd-setup        # initializes .sdlc/ AND installs this harness

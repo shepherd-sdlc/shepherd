@@ -6,8 +6,8 @@
     "name": "Matt Kruczek",
     "url": "https://github.com/MCKRUZ"
   },
-  "homepage": "https://github.com/MCKRUZ/shepherd",
-  "repository": "https://github.com/MCKRUZ/shepherd",
+  "homepage": "https://github.com/shepherd-sdlc/shepherd",
+  "repository": "https://github.com/shepherd-sdlc/shepherd",
   "license": "Apache-2.0",
   "keywords": [
     "sdlc",
