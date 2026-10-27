@@ -6,8 +6,9 @@ discovery to close, using a company-configurable profile. Each phase has documen
 gates that check them, and a named person who signs off.
 
 This repository is Shepherd Free, published under the Apache License 2.0. It is generated from
-Shepherd's source on each release, so it has no history of its own. Pull requests are welcome:
-an accepted change is applied to the source and appears here in the next release.
+Shepherd's source on each release, so it has no history of its own and takes no changes directly:
+a pull request opened here is closed automatically. Report a bug or ask for a change in an issue;
+a fix is made in the source and appears here in the next release.
 
 ## Layout
 - `.claude-plugin/plugin.json` — the plugin manifest

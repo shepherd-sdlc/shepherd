@@ -1,5 +1,12 @@
 # Changelog
 
+## 2.2.0
+
+- **`/sprd-update`** says which Shepherd you run, which release is current, and runs the one
+  `claude plugin` step that moves you forward when you say yes. It then offers to turn on Claude
+  Code's automatic updates, which are off by default for this catalogue. `docs/updating.md` has
+  the route by hand.
+
 ## 2.1.0 — first public release
 
 Shepherd Free is published under the Apache License 2.0. It is generated from Shepherd's source,

@@ -59,6 +59,12 @@ spec-gate, grader, correctness-review, security-review) block at merge via the
 branch-protection ruleset, and `infra/` starters). To add or refresh just the
 harness in an existing repo, use `/sprd-harness`. Requires Claude Code v2.1.196+ (`source: "."`).
 
+### Updating
+
+Run `/sprd-update`: it says which Shepherd you have, which is current, and runs the one step that
+moves you forward when you say yes. From 1.x (`/sdlc-*` commands), or a 2.x without that command,
+see [docs/updating.md](docs/updating.md).
+
 ### As a Claude Code Skill (local dev)
 
 ```bash
@@ -167,6 +173,7 @@ For in-depth technical documentation, see the guides in [`docs/`](docs/):
 | `/sprd-doctor` | Day-1 environment check — proves the installed harness can actually run here |
 | `/sprd-harness` | Install or refresh the delivery harness in an existing repository |
 | `/sprd-upgrade` | Bring an installed harness forward to the plugin's current version without clobbering the repo's adaptations |
+| `/sprd-update` | Bring Shepherd itself up to date: says which version you run and which is current, runs the one `claude plugin` step that moves you forward on your yes, and offers automatic updates |
 
 
 ## Profiles
@@ -263,10 +270,10 @@ This plugin follows **ADR-001: Shepherd is a Claude Code plugin that executes AI
 
 ## Contributing
 
-1. Fork the repo
-2. Create a feature branch: `feat/my-feature`
-3. Follow the conventional commit format: `type: description`
-4. Submit a PR with a clear description
+Shepherd is developed in a private source repository. This repository is generated from it and
+published on each release, so it takes no changes directly: nobody commits here by hand, and a pull
+request opened here is closed. To report a bug or ask for a change, open an issue here; a fix is
+made in the source and arrives with the next release.
 
 ## License
 

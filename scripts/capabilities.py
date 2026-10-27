@@ -139,6 +139,11 @@ CAPABILITIES: dict[str, dict] = {
     "issue-features": {"script": "report_issue.py", "argv": ["features"], "flags": ["--repo", "--state", "--spec", "--json"]},
     "issue-set-feature": {"script": "report_issue.py", "argv": ["set-feature"], "flags": ["--issue", "--feature", "--by", "--reason", "--json"]},
     "issue-to-boards": {"script": "report_issue.py", "argv": ["new"], "flags": ["--feature", "--to-boards"]},
+    # /sprd-update: is this machine's Shepherd current, and the one `claude plugin` step that moves it
+    # forward. The app's Settings shows the check (never with --refresh: that spawns `claude`) and offers
+    # the auto-update switch; an older plugin gets a sentence naming the step instead.
+    "plugin-update": {"script": "plugin_update.py", "argv": ["check"], "flags": ["--refresh", "--project", "--json"]},
+    "plugin-auto-update": {"script": "plugin_update.py", "argv": ["auto-update"], "flags": ["--catalogue", "--json"]},
 }
 
 

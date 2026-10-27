@@ -617,7 +617,7 @@ The Build loop's Intent beat — before building any change. A spec that `check_
 
 ## Additional Commands (summaries)
 
-Seven commands have their full flow documented in their command files rather than here.
+Eight commands have their full flow documented in their command files rather than here.
 One line each; see `commands/<name>.md` for the complete instructions.
 
 | Command | What it does |
@@ -628,6 +628,7 @@ One line each; see `commands/<name>.md` for the complete instructions.
 | `/sprd-doctor` | Verify the installed harness will actually run in this repo — interpreters present, rails scripts executable, required secrets set, branch protection active — and print the fix for anything that will not. **Pack-aware:** reads the installed CI/CD pack from the harness manifest and checks GitHub installs with `gh` (repo secrets, ruleset), Azure DevOps installs with `az` (variable groups read from the installed pipelines, branch policies) — never asks a repo to install the other platform's CLI. The harness fails quietly; this is what makes it fail loudly |
 | `/sprd-harness` | Install or refresh the delivery harness independent of a full `/sprd-setup` |
 | `/sprd-upgrade` | Bring an installed harness forward safely using the install manifest — updates factory-original files, preserves adaptations, surfaces both-sides changes as `.harness-new` siblings to merge |
+| `/sprd-update` | Bring the Shepherd plugin itself up to date. `plugin_update.py check --refresh` reads what Claude Code recorded (install registry, catalogues, enabled list), names the edition each catalogue really points at, and prints the one `claude plugin` command that moves this machine forward: install `shepherd` after a 1.x rename, `update`, or disable Free beside Pro. The command runs it on a yes and checks again; `auto-update --catalogue <name>` turns on Claude Code's automatic updates. Machine-level, needs no `.sdlc/`. See `docs/updating.md` |
 | `/sprd-report-issue` | Bugs in the product the team is building, as records that become specs: an `AskUserQuestion` interview over `issue_model.py`'s plan (title, what / expected / steps, the product's channel with its follow-ups, environment and build, severity, frequency, data impact, the type of user and the reporter's role, one screenshot that is an image by its bytes, the privacy statement) writes nothing until the minimum is met (exit 1 lists every gap; an AI name or a token-shaped string is exit 2). Then `triage` by someone other than the reporter, `prioritize` P1–P3 with an open target sprint, `promote` to a `type: bugfix` spec through `new_spec.py` with `--slate` into the sprint (agent proposes tier and priority, a named human confirms), `sync` to `fixed` when the spec merges, `note`, `reopen`, `show` (allowed actions and why not), `list --queue`, and `file` → `gh issue create` / `az boards work-item create --type Bug` after `--dry-run`. `references/issue-lifecycle.md` |
 
 ---
